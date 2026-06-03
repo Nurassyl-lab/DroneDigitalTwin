@@ -47,7 +47,8 @@ async def main(scenefile):
         chase_cam_window = "ChaseCam"
         image_display.add_chase_cam(chase_cam_window)
         client.subscribe(
-            drone.sensors["Chase"]["scene_camera"],
+            # drone.sensors["Chase"]["scene_camera"],
+            drone.sensors["DownCamera"]["depth_camera"],
             lambda _, chase: image_display.receive(chase, chase_cam_window),
         )
 
@@ -131,7 +132,8 @@ async def main(scenefile):
 
 
 if __name__ == "__main__":
-    scene_files = {"hitl": "scene_px4_hitl.jsonc", "sitl": "scene_px4_sitl.jsonc"}
+    # scene_files = {"hitl": "scene_px4_hitl.jsonc", "sitl": "scene_px4_sitl.jsonc"}
+    scene_files = {"sitl": "scene_px4_sitl.jsonc"}
 
     parser = argparse.ArgumentParser(description="Basic drone exercise with PX4.")
     parser.add_argument(
@@ -146,6 +148,10 @@ if __name__ == "__main__":
         default="sitl",
     )
     args = parser.parse_args()
+
+    assert args.mode == "sitl", \
+        "Currently only SITL mode is supported for this example script. Please use the SITL configuration to run the example."
+
 
     scene_to_run = scene_files.get(args.mode)
     asyncio.run(main(scene_to_run))  # Runner for async main function

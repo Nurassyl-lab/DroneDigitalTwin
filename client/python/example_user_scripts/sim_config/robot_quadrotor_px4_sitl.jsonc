@@ -205,16 +205,17 @@
       "use-serial": false,
       "use-tcp": true,
       "tcp-port": 4560,
-      "control-ip-address": "127.0.0.1",
-      // "local-host-ip": "xxx.xxx.xxx.xxx", // for PX4 on WSL2
-      // "control-ip-address": "remote",
+      // "control-ip-address": "127.0.0.1",
+      // "local-host-ip": "172.20.80.247", // for PX4 on WSL2
+      "local-host-ip": "172.20.80.1",
+      "control-ip-address": "remote",
       "control-port": 14540,
-      "qgc-host-ip": "",
+      "qgc-host-ip": "127.0.0.1",
       "qgc-port": 14550,
       "parameters": {
         "NAV_RCL_ACT": 0,
         "NAV_DLL_ACT": 0,
-        "COM_OBL_ACT": 1,
+        // "COM_OBL_ACT": 1,
         "LPE_LAT": 47.641468,
         "LPE_LON": -122.140165
       },
