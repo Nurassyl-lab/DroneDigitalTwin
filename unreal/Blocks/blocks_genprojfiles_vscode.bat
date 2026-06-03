@@ -12,6 +12,7 @@ Unreal engine's root folder path, ex. C:\Program Files\Epic Games\UE_5.0
   REM Generate VS Code UE project workspace files (overwrites .vscode\settings.json)
   echo:Generating VS Code project files with environment variable UE_ROOT=%UE_ROOT%
   cd %~dp0
+  REM cd /d %~dp0\..\..
   "%UE_ROOT%\Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.exe" -projectfiles -vscode -project="%~dp0\Blocks.uproject" -game
 
   REM Insert projectairsim project folder into UE-generated Block.code-workspace
