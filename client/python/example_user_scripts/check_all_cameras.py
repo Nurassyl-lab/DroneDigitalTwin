@@ -39,6 +39,14 @@ CAMERA_CHOICES = tuple(RGB_CAMERA_SENSORS.keys()) + (
     "lidar",
     "all",
 )
+DEPTH_UNIT_CHOICES = ("m", "mm")
+
+
+def depth_frame_to_meters(frame, units: str):
+    depth = np.asarray(frame).squeeze().astype(np.float32)
+    if units == "mm":
+        return depth / 1000.0
+    return depth
 
 
 @dataclass
@@ -68,12 +76,14 @@ class OpenCvPreview:
         height: int,
         depth_min_m: float,
         depth_max_m: float,
+        depth_units: str,
         depth_invert: bool,
     ):
         self.width = width
         self.height = height
         self.depth_min_m = max(0.0, depth_min_m)
         self.depth_max_m = max(depth_max_m, self.depth_min_m + 0.001)
+        self.depth_units = depth_units
         self.depth_invert = depth_invert
         self.windows: Dict[str, Dict] = {}
         self.running = False
@@ -159,13 +169,13 @@ class OpenCvPreview:
     def _depth_to_colormap(self, frame):
         import cv2
 
-        depth_mm = np.asarray(frame).squeeze().astype(np.float32)
-        valid_mask = depth_mm > 0
-        min_mm = self.depth_min_m * 1000.0
-        max_mm = self.depth_max_m * 1000.0
+        depth_m = depth_frame_to_meters(frame, self.depth_units)
+        valid_mask = depth_m > 0
 
-        clipped = np.clip(depth_mm, min_mm, max_mm)
-        normalized = (clipped - min_mm) / (max_mm - min_mm)
+        clipped = np.clip(depth_m, self.depth_min_m, self.depth_max_m)
+        normalized = (clipped - self.depth_min_m) / (
+            self.depth_max_m - self.depth_min_m
+        )
         if self.depth_invert:
             normalized = 1.0 - normalized
 
@@ -191,15 +201,17 @@ def summarize_image(image) -> str:
     return f"{width}x{height}, encoding={encoding}, bytes={data_len}"
 
 
-def summarize_depth(image) -> str:
+def summarize_depth(image, units: str) -> str:
     try:
         frame = np.asarray(unpack_image(image)).squeeze()
         valid = frame[frame > 0]
         if valid.size == 0:
             return f"{summarize_image(image)}, depth=no valid pixels"
-        valid_m = valid.astype(np.float32) / 1000.0
+        valid_m = depth_frame_to_meters(valid, units)
         return (
-            f"{summarize_image(image)}, depth_min_m={valid_m.min():.2f}, "
+            f"{summarize_image(image)}, depth_units={units}, "
+            f"raw_min={valid.min()}, raw_max={valid.max()}, "
+            f"depth_min_m={valid_m.min():.2f}, "
             f"depth_p50_m={np.percentile(valid_m, 50):.2f}, "
             f"depth_p95_m={np.percentile(valid_m, 95):.2f}, "
             f"depth_max_m={valid_m.max():.2f}"
@@ -255,7 +267,7 @@ def subscribe_depth(client, drone, args, stats, preview):
         preview.add_window(window_name, "depth")
 
     def callback(_, image):
-        stats["depth"].record(summarize_depth(image))
+        stats["depth"].record(summarize_depth(image, args.depth_units))
         if preview:
             preview.receive(window_name, image)
 
@@ -336,6 +348,7 @@ async def main(args):
                 args.preview_height,
                 args.depth_min_m,
                 args.depth_max_m,
+                args.depth_units,
                 args.depth_invert,
             )
 
@@ -448,6 +461,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=15.0,
         help="Farthest depth value mapped into the preview color range.",
+    )
+    parser.add_argument(
+        "--depth-units",
+        type=str,
+        choices=DEPTH_UNIT_CHOICES,
+        default="m",
+        help="Units used by the raw depth stream before preview scaling.",
     )
     parser.add_argument(
         "--no-depth-invert",
