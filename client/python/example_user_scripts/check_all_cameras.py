@@ -409,7 +409,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the sensor used by --camera rgb. Directional rgb modes use their named sensors.",
     )
-    parser.add_argument("--depth-sensor", default="DownCamera")
+    parser.add_argument(
+        "--depth-sensor",
+        default="FrontCamera",
+        help="Depth camera sensor to validate. Use DownCamera for the old downward view.",
+    )
     parser.add_argument("--lidar-sensor", default="lidar1")
     parser.add_argument("--preview-width", type=int, default=800)
     parser.add_argument("--preview-height", type=int, default=450)

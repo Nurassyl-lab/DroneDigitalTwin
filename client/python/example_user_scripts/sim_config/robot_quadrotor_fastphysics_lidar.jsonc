@@ -347,6 +347,16 @@
           "pixels-as-float": false,
           "compress": false,
           "target-gamma": 2.5
+        },
+        {
+          "image-type": 2,
+          "width": 400,
+          "height": 225,
+          "fov-degrees": 90,
+          "capture-enabled": true,
+          "streaming-enabled": false,
+          "pixels-as-float": false,
+          "compress": false
         }
       ],
       "origin": {
