@@ -393,3 +393,5 @@ unreal/LowPolyRiverForest/
 # MISC
 test.cpp
 astar_map_view.png
+client/python/example_user_scripts/riverside_forest_3d.png
+client/python/example_user_scripts/riverside_forest.png
