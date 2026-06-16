@@ -3,6 +3,16 @@ Visualize Project AirSim NED coordinates for PX4 waypoint selection.
 
 This helper loads a scene, samples a voxel grid, saves a top-down occupancy
 slice, and optionally draws persistent debug markers in Unreal.
+
+python px4_map_viewer.py `
+   --start "30,0,-6" `
+   --goal "30,-48,-10" `
+   --slice-z-ned -8 `
+   --resolution-m 1 `
+   --grid-step-m 10 `
+   --label-step-m 20 `
+   --output astar_map_view.png `
+   --map-size "120,120,40"
 """
 
 import argparse
