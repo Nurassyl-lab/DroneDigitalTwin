@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import math
 import time
+import sys
 from typing import List, Sequence
 
 from projectairsim import Drone, ProjectAirSimClient, World
@@ -32,6 +33,19 @@ def parse_vector3(value: str) -> List[float]:
             f"Coordinates must be numeric: '{value}'"
         ) from exc
 
+def normalize_vector_args(argv: Sequence[str]) -> List[str]:
+    normalized = []
+    vector_options = {"--start", "--goal", "--map-center", "--map-size"}
+    idx = 0
+    while idx < len(argv):
+        arg = argv[idx]
+        if arg in vector_options and idx + 1 < len(argv):
+            normalized.append(f"{arg}={argv[idx + 1]}")
+            idx += 2
+            continue
+        normalized.append(arg)
+        idx += 1
+    return normalized
 
 def parse_size3(value: str) -> List[int]:
     size = parse_vector3(value)
@@ -610,4 +624,4 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    asyncio.run(run_autopilot(build_parser().parse_args()))
+    asyncio.run(run_autopilot(build_parser().parse_args(normalize_vector_args(sys.argv[1:]))))
