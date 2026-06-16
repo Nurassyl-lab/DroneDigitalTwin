@@ -10,6 +10,7 @@ Examples:
     python check_all_cameras.py --camera depth
     python check_all_cameras.py --camera lidar
     python check_all_cameras.py --camera all --fly-pattern
+    python check_all_cameras.py --camera depth --fly-pattern --avoid-obstacles
 """
 
 import argparse
@@ -47,6 +48,40 @@ def depth_frame_to_meters(frame, units: str):
     if units == "mm":
         return depth / 1000.0
     return depth
+
+
+class DepthSafetyMonitor:
+    def __init__(self, units: str, stop_distance_m: float, roi_fraction: float):
+        self.units = units
+        self.stop_distance_m = stop_distance_m
+        self.roi_fraction = max(0.05, min(1.0, roi_fraction))
+        self.closest_forward_m: Optional[float] = None
+        self.last_seen_at: Optional[float] = None
+
+    def update(self, image):
+        frame = np.asarray(unpack_image(image)).squeeze()
+        if frame.ndim != 2:
+            return
+
+        height, width = frame.shape
+        roi_width = max(1, int(width * self.roi_fraction))
+        roi_height = max(1, int(height * self.roi_fraction))
+        x0 = max(0, (width - roi_width) // 2)
+        y0 = max(0, (height - roi_height) // 2)
+        roi = frame[y0 : y0 + roi_height, x0 : x0 + roi_width]
+        valid = roi[roi > 0]
+        if valid.size == 0:
+            return
+
+        self.closest_forward_m = float(depth_frame_to_meters(valid, self.units).min())
+        self.last_seen_at = time.time()
+
+    def should_stop(self) -> bool:
+        if self.closest_forward_m is None or self.last_seen_at is None:
+            return False
+        if time.time() - self.last_seen_at > 1.0:
+            return False
+        return self.closest_forward_m <= self.stop_distance_m
 
 
 @dataclass
@@ -260,7 +295,7 @@ def subscribe_rgb(client, drone, args, stats, preview, mode: str):
     projectairsim_log().info("Subscribed %s topic: %s", mode, topic)
 
 
-def subscribe_depth(client, drone, args, stats, preview):
+def subscribe_depth(client, drone, args, stats, preview, safety_monitor=None):
     topic = require_topic(drone, args.depth_sensor, "depth_camera")
     window_name = f"Depth - {args.depth_sensor}"
     if preview:
@@ -268,6 +303,8 @@ def subscribe_depth(client, drone, args, stats, preview):
 
     def callback(_, image):
         stats["depth"].record(summarize_depth(image, args.depth_units))
+        if safety_monitor:
+            safety_monitor.update(image)
         if preview:
             preview.receive(window_name, image)
 
@@ -287,7 +324,11 @@ def subscribe_lidar(client, drone, args, stats, lidar_display):
     projectairsim_log().info("Subscribed lidar topic: %s", topic)
 
 
-async def run_flight_pattern(drone: Drone, velocity_mps: float):
+async def run_flight_pattern(
+    drone: Drone,
+    velocity_mps: float,
+    safety_monitor: Optional[DepthSafetyMonitor] = None,
+):
     if not drone.enable_api_control():
         raise RuntimeError("Failed to enable API control")
     if not drone.arm():
@@ -308,10 +349,26 @@ async def run_flight_pattern(drone: Drone, velocity_mps: float):
         ("down", 0.0, 0.0, velocity_mps, 3.0),
     ]
     try:
+        command_step_sec = 0.25
         for label, north, east, down, duration in commands:
             projectairsim_log().info("Flight pattern move %s", label)
-            task = await drone.move_by_velocity_async(north, east, down, duration)
-            await task
+            remaining = duration
+            while remaining > 0:
+                if safety_monitor and safety_monitor.should_stop():
+                    projectairsim_log().warning(
+                        "Stopping flight pattern: depth obstacle at %.2fm",
+                        safety_monitor.closest_forward_m,
+                    )
+                    task = await drone.move_by_velocity_async(0.0, 0.0, 0.0, 0.5)
+                    await task
+                    return
+
+                step_duration = min(command_step_sec, remaining)
+                task = await drone.move_by_velocity_async(
+                    north, east, down, step_duration
+                )
+                await task
+                remaining -= step_duration
     finally:
         drone.disarm()
         drone.disable_api_control()
@@ -331,6 +388,7 @@ async def main(args):
     preview = None
     lidar_display = None
     flight_task = None
+    safety_monitor = None
 
     try:
         client.connect()
@@ -362,11 +420,18 @@ async def main(args):
                 view=LidarDisplay.VIEW_FORWARD,
             )
 
+        if args.avoid_obstacles and "depth" in modes:
+            safety_monitor = DepthSafetyMonitor(
+                args.depth_units,
+                args.obstacle_stop_distance_m,
+                args.obstacle_roi_fraction,
+            )
+
         for mode in modes:
             if mode in RGB_CAMERA_SENSORS:
                 subscribe_rgb(client, drone, args, stats, preview, mode)
         if "depth" in modes:
-            subscribe_depth(client, drone, args, stats, preview)
+            subscribe_depth(client, drone, args, stats, preview, safety_monitor)
         if "lidar" in modes:
             subscribe_lidar(client, drone, args, stats, lidar_display)
 
@@ -376,7 +441,9 @@ async def main(args):
             lidar_display.start()
 
         if args.fly_pattern:
-            flight_task = asyncio.create_task(run_flight_pattern(drone, args.velocity_mps))
+            flight_task = asyncio.create_task(
+                run_flight_pattern(drone, args.velocity_mps, safety_monitor)
+            )
 
         started_at = time.time()
         last_report_at = 0.0
@@ -482,6 +549,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-display", action="store_true")
     parser.add_argument("--fly-pattern", action="store_true")
     parser.add_argument("--velocity-mps", type=float, default=2.0)
+    parser.add_argument(
+        "--avoid-obstacles",
+        action="store_true",
+        help="Use the selected depth stream to stop --fly-pattern before a close obstacle.",
+    )
+    parser.add_argument("--obstacle-stop-distance-m", type=float, default=3.0)
+    parser.add_argument("--obstacle-roi-fraction", type=float, default=0.35)
     return parser
 
 
