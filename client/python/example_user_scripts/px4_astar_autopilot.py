@@ -536,6 +536,68 @@ async def request_px4_control(drone: Drone):
     await request_control_task
 
 
+async def command_world_velocity(
+    drone: Drone,
+    velocity: Sequence[float],
+    duration_sec: float,
+):
+    await drone.move_by_velocity_async(
+        v_north=velocity[0],
+        v_east=velocity[1],
+        v_down=velocity[2],
+        duration=duration_sec,
+        yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
+        yaw_is_rate=True,
+        yaw=0.0,
+    )
+
+
+async def brake_to_stop_by_velocity(
+    drone: Drone,
+    commanded_velocity: Sequence[float],
+    command_duration_sec: float,
+    max_velocity_delta: float,
+) -> List[float]:
+    stop_velocity = [0.0, 0.0, 0.0]
+    velocity = [float(commanded_velocity[0]), float(commanded_velocity[1]), float(commanded_velocity[2])]
+
+    while vector_magnitude(velocity) > 0.05:
+        velocity = limit_vector_delta(
+            velocity,
+            stop_velocity,
+            max_velocity_delta,
+        )
+        await command_world_velocity(drone, velocity, command_duration_sec)
+        await asyncio.sleep(command_duration_sec)
+
+    await command_world_velocity(drone, stop_velocity, command_duration_sec)
+    await asyncio.sleep(command_duration_sec)
+    return stop_velocity
+
+
+async def hold_waypoint_by_velocity(
+    drone: Drone,
+    hold_sec: float,
+    command_duration_sec: float,
+    label: str,
+    flight_trace: FlightTrace = None,
+    live_ned: LiveNedDisplay = None,
+):
+    if hold_sec <= 0.0:
+        return
+
+    projectairsim_log().info("%s holding for %.1fs", label, hold_sec)
+    hold_until = time.time() + hold_sec
+    while time.time() < hold_until:
+        position = get_pose_position_ned(drone)
+        if flight_trace:
+            flight_trace.record(f"{label} hold", position)
+        if live_ned:
+            live_ned.show(f"{label} hold", position)
+        await command_world_velocity(drone, [0.0, 0.0, 0.0], command_duration_sec)
+        await asyncio.sleep(command_duration_sec)
+
+
 async def fly_to_point_by_velocity(
     drone: Drone,
     target: Sequence[float],
@@ -579,22 +641,12 @@ async def fly_to_point_by_velocity(
 
         if distance <= acceptance_m:
             if stop_at_target:
-                stop_velocity = [0.0, 0.0, 0.0]
-                commanded_velocity = limit_vector_delta(
+                commanded_velocity = await brake_to_stop_by_velocity(
+                    drone,
                     commanded_velocity,
-                    stop_velocity,
+                    command_duration_sec,
                     max_velocity_delta,
                 )
-                await drone.move_by_velocity_async(
-                    v_north=commanded_velocity[0],
-                    v_east=commanded_velocity[1],
-                    v_down=commanded_velocity[2],
-                    duration=command_duration_sec,
-                    yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
-                    yaw_is_rate=True,
-                    yaw=0.0,
-                )
-                await asyncio.sleep(command_duration_sec)
             if flight_trace:
                 flight_trace.record(label, current, force=True)
             if live_ned:
@@ -657,6 +709,7 @@ async def fly_path_by_velocity(
     command_duration_sec: float,
     acceleration_limit_mps2: float,
     slowdown_distance_m: float,
+    waypoint_hold_sec: float,
     flight_trace: FlightTrace = None,
     live_ned: LiveNedDisplay = None,
 ):
@@ -664,6 +717,8 @@ async def fly_path_by_velocity(
     commanded_velocity = [0.0, 0.0, 0.0]
     final_waypoint_index = len(path) - 1
     for index, waypoint in enumerate(path[1:], start=1):
+        is_final_waypoint = index == final_waypoint_index
+        should_hold = waypoint_hold_sec > 0.0 and not is_final_waypoint
         commanded_velocity = await fly_to_point_by_velocity(
             drone,
             waypoint,
@@ -677,11 +732,20 @@ async def fly_path_by_velocity(
             acceleration_limit_mps2,
             slowdown_distance_m,
             commanded_velocity,
-            index == final_waypoint_index,
+            is_final_waypoint or should_hold,
             False,
             flight_trace,
             live_ned,
         )
+        if should_hold:
+            await hold_waypoint_by_velocity(
+                drone,
+                waypoint_hold_sec,
+                command_duration_sec,
+                f"Waypoint {index:03d}",
+                flight_trace,
+                live_ned,
+            )
 
 
 async def run_px4_keyboard_control(
@@ -1114,6 +1178,7 @@ async def run_autopilot(args):
                 args.velocity_command_duration_sec,
                 args.acceleration_limit_mps2,
                 args.slowdown_distance_m,
+                args.waypoint_hold_sec,
                 flight_trace,
                 live_ned,
             )
@@ -1264,6 +1329,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-map-size-m", type=float, default=50.0)
     parser.add_argument("--ground-z-ned", type=float, default=0.0)
     parser.add_argument("--waypoint-spacing-m", type=float, default=3.0)
+    parser.add_argument(
+        "--waypoint-hold-sec",
+        type=float,
+        default=0.0,
+        help="Seconds to brake and hover at each intermediate waypoint.",
+    )
     parser.add_argument(
         "--velocity-command-duration-sec",
         type=float,
