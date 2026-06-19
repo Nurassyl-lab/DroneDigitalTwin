@@ -172,6 +172,37 @@ def distance_between(a: Sequence[float], b: Sequence[float]) -> float:
     return math.sqrt(sum((a[idx] - b[idx]) ** 2 for idx in range(3)))
 
 
+def vector_magnitude(values: Sequence[float]) -> float:
+    return math.sqrt(sum(component * component for component in values))
+
+
+def limit_vector_delta(
+    current: Sequence[float],
+    target: Sequence[float],
+    max_delta: float,
+) -> List[float]:
+    if max_delta <= 0.0:
+        return [float(target[0]), float(target[1]), float(target[2])]
+
+    delta = [target[idx] - current[idx] for idx in range(3)]
+    delta_magnitude = vector_magnitude(delta)
+    if delta_magnitude <= max_delta or delta_magnitude == 0.0:
+        return [float(target[0]), float(target[1]), float(target[2])]
+
+    scale = max_delta / delta_magnitude
+    return [current[idx] + delta[idx] * scale for idx in range(3)]
+
+
+def move_scalar_toward(current: float, target: float, max_delta: float) -> float:
+    if max_delta <= 0.0:
+        return target
+
+    delta = target - current
+    if abs(delta) <= max_delta:
+        return target
+    return current + math.copysign(max_delta, delta)
+
+
 async def teleport_and_verify(
     drone: Drone,
     target: Sequence[float],
@@ -514,12 +545,27 @@ async def fly_to_point_by_velocity(
     report_interval_sec: float,
     face_travel_direction: bool,
     label: str,
+    command_duration_sec: float,
+    acceleration_limit_mps2: float,
+    slowdown_distance_m: float,
+    initial_velocity: Sequence[float] = None,
+    stop_at_target: bool = True,
+    request_control: bool = True,
     flight_trace: FlightTrace = None,
     live_ned: LiveNedDisplay = None,
-):
-    await request_px4_control(drone)
+) -> List[float]:
+    if request_control:
+        await request_px4_control(drone)
     started_at = time.time()
     last_report_at = 0.0
+    commanded_velocity = (
+        [float(initial_velocity[0]), float(initial_velocity[1]), float(initial_velocity[2])]
+        if initial_velocity is not None
+        else [0.0, 0.0, 0.0]
+    )
+    command_duration_sec = max(0.05, command_duration_sec)
+    max_velocity_delta = max(0.0, acceleration_limit_mps2) * command_duration_sec
+    slowdown_distance_m = max(acceptance_m, slowdown_distance_m)
 
     while True:
         current = get_pose_position_ned(drone)
@@ -532,6 +578,23 @@ async def fly_to_point_by_velocity(
         elapsed = time.time() - started_at
 
         if distance <= acceptance_m:
+            if stop_at_target:
+                stop_velocity = [0.0, 0.0, 0.0]
+                commanded_velocity = limit_vector_delta(
+                    commanded_velocity,
+                    stop_velocity,
+                    max_velocity_delta,
+                )
+                await drone.move_by_velocity_async(
+                    v_north=commanded_velocity[0],
+                    v_east=commanded_velocity[1],
+                    v_down=commanded_velocity[2],
+                    duration=command_duration_sec,
+                    yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
+                    yaw_is_rate=True,
+                    yaw=0.0,
+                )
+                await asyncio.sleep(command_duration_sec)
             if flight_trace:
                 flight_trace.record(label, current, force=True)
             if live_ned:
@@ -540,7 +603,7 @@ async def fly_to_point_by_velocity(
                 f"{label} reached target {format_vector3(target)}; pose NED "
                 f"{format_vector3(current)}; error {distance:.2f} m"
             )
-            return
+            return commanded_velocity
 
         if timeout_sec > 0 and elapsed > timeout_sec:
             drone.cancel_last_task()
@@ -557,27 +620,30 @@ async def fly_to_point_by_velocity(
             )
             last_report_at = elapsed
 
-        duration = min(0.5, max(0.1, distance / max(velocity_mps, 0.1)))
-        speed = min(velocity_mps, distance / duration)
-        velocity = [(component / distance) * speed for component in delta]
+        speed_scale = min(1.0, max(0.2, distance / slowdown_distance_m))
+        desired_speed = min(velocity_mps, distance / command_duration_sec) * speed_scale
+        desired_velocity = [(component / distance) * desired_speed for component in delta]
+        commanded_velocity = limit_vector_delta(
+            commanded_velocity,
+            desired_velocity,
+            max_velocity_delta,
+        )
         yaw_control_mode = (
             YawControlMode.ForwardOnly
             if face_travel_direction
             else YawControlMode.MaxDegreeOfFreedom
         )
 
-        move_task = await drone.move_by_velocity_async(
-            v_north=velocity[0],
-            v_east=velocity[1],
-            v_down=velocity[2],
-            duration=duration,
+        await drone.move_by_velocity_async(
+            v_north=commanded_velocity[0],
+            v_east=commanded_velocity[1],
+            v_down=commanded_velocity[2],
+            duration=command_duration_sec,
             yaw_control_mode=yaw_control_mode,
             yaw_is_rate=not face_travel_direction,
             yaw=0.0,
         )
-        result = await move_task
-        if result is False:
-            raise RuntimeError(f"{label} velocity command returned False")
+        await asyncio.sleep(command_duration_sec)
 
 
 async def fly_path_by_velocity(
@@ -588,11 +654,17 @@ async def fly_path_by_velocity(
     timeout_sec: float,
     report_interval_sec: float,
     face_travel_direction: bool,
+    command_duration_sec: float,
+    acceleration_limit_mps2: float,
+    slowdown_distance_m: float,
     flight_trace: FlightTrace = None,
     live_ned: LiveNedDisplay = None,
 ):
+    await request_px4_control(drone)
+    commanded_velocity = [0.0, 0.0, 0.0]
+    final_waypoint_index = len(path) - 1
     for index, waypoint in enumerate(path[1:], start=1):
-        await fly_to_point_by_velocity(
+        commanded_velocity = await fly_to_point_by_velocity(
             drone,
             waypoint,
             velocity_mps,
@@ -601,6 +673,12 @@ async def fly_path_by_velocity(
             report_interval_sec,
             face_travel_direction,
             f"Waypoint {index:03d}",
+            command_duration_sec,
+            acceleration_limit_mps2,
+            slowdown_distance_m,
+            commanded_velocity,
+            index == final_waypoint_index,
+            False,
             flight_trace,
             live_ned,
         )
@@ -611,11 +689,18 @@ async def run_px4_keyboard_control(
     velocity_mps: float,
     yaw_rate_dps: float,
     command_duration_sec: float,
+    acceleration_limit_mps2: float,
+    yaw_acceleration_dps2: float,
     live_ned: LiveNedDisplay,
     flight_trace: FlightTrace = None,
 ):
     keyboard_module = load_keyboard_module()
     await request_px4_control(drone)
+    command_duration_sec = max(0.05, command_duration_sec)
+    max_velocity_delta = max(0.0, acceleration_limit_mps2) * command_duration_sec
+    max_yaw_delta = max(0.0, yaw_acceleration_dps2) * command_duration_sec
+    commanded_velocity = [0.0, 0.0, 0.0]
+    commanded_yaw_rate = 0.0
 
     print("\n--- PX4 Keyboard Control ---")
     print("W/S: forward/backward")
@@ -633,27 +718,28 @@ async def run_px4_keyboard_control(
         if live_ned:
             live_ned.show("Keyboard control", current)
 
-        vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
+        target_velocity = [0.0, 0.0, 0.0]
+        target_yaw_rate = 0.0
 
         if keyboard_module.is_pressed("w"):
-            vx = velocity_mps
+            target_velocity[0] = velocity_mps
         elif keyboard_module.is_pressed("s"):
-            vx = -velocity_mps
+            target_velocity[0] = -velocity_mps
 
         if keyboard_module.is_pressed("a"):
-            vy = -velocity_mps
+            target_velocity[1] = -velocity_mps
         elif keyboard_module.is_pressed("d"):
-            vy = velocity_mps
+            target_velocity[1] = velocity_mps
 
         if keyboard_module.is_pressed("up"):
-            vz = -velocity_mps
+            target_velocity[2] = -velocity_mps
         elif keyboard_module.is_pressed("down"):
-            vz = velocity_mps
+            target_velocity[2] = velocity_mps
 
         if keyboard_module.is_pressed("left"):
-            yaw_rate = -yaw_rate_dps
+            target_yaw_rate = -yaw_rate_dps
         elif keyboard_module.is_pressed("right"):
-            yaw_rate = yaw_rate_dps
+            target_yaw_rate = yaw_rate_dps
 
         if keyboard_module.is_pressed("l"):
             projectairsim_log().info("Keyboard requested landing")
@@ -673,25 +759,30 @@ async def run_px4_keyboard_control(
             projectairsim_log().info("Keyboard requested quit")
             return
 
-        if vx != 0.0 or vy != 0.0 or vz != 0.0:
-            move_task = await drone.move_by_velocity_body_frame_async(
-                vx,
-                vy,
-                vz,
-                command_duration_sec,
-            )
-            result = await move_task
-            if result is False:
-                raise RuntimeError("Keyboard velocity command returned False")
+        commanded_velocity = limit_vector_delta(
+            commanded_velocity,
+            target_velocity,
+            max_velocity_delta,
+        )
+        commanded_yaw_rate = move_scalar_toward(
+            commanded_yaw_rate,
+            target_yaw_rate,
+            max_yaw_delta,
+        )
 
-        if yaw_rate != 0.0:
-            yaw_task = await drone.rotate_by_yaw_rate_async(
-                yaw_rate,
+        if vector_magnitude(commanded_velocity) > 0.05 or vector_magnitude(target_velocity) > 0.0:
+            await drone.move_by_velocity_body_frame_async(
+                commanded_velocity[0],
+                commanded_velocity[1],
+                commanded_velocity[2],
                 command_duration_sec,
             )
-            result = await yaw_task
-            if result is False:
-                raise RuntimeError("Keyboard yaw command returned False")
+
+        if abs(commanded_yaw_rate) > 0.1 or abs(target_yaw_rate) > 0.0:
+            await drone.rotate_by_yaw_rate_async(
+                commanded_yaw_rate,
+                command_duration_sec,
+            )
 
         await asyncio.sleep(0.02)
 
@@ -852,6 +943,8 @@ async def run_autopilot(args):
                 args.keyboard_speed_mps,
                 args.keyboard_yaw_rate_dps,
                 args.keyboard_command_duration_sec,
+                args.keyboard_acceleration_limit_mps2,
+                args.keyboard_yaw_acceleration_dps2,
                 live_ned,
                 flight_trace,
             )
@@ -970,6 +1063,12 @@ async def run_autopilot(args):
                     args.pose_report_interval_sec,
                     args.face_travel_direction,
                     "Move to start",
+                    args.velocity_command_duration_sec,
+                    args.acceleration_limit_mps2,
+                    args.slowdown_distance_m,
+                    None,
+                    True,
+                    True,
                     flight_trace,
                     live_ned,
                 )
@@ -1010,6 +1109,9 @@ async def run_autopilot(args):
                 args.move_timeout_sec,
                 args.pose_report_interval_sec,
                 args.face_travel_direction,
+                args.velocity_command_duration_sec,
+                args.acceleration_limit_mps2,
+                args.slowdown_distance_m,
                 flight_trace,
                 live_ned,
             )
@@ -1133,6 +1235,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Duration of each keyboard velocity/yaw command.",
     )
     parser.add_argument(
+        "--keyboard-acceleration-limit-mps2",
+        type=float,
+        default=6.0,
+        help="Maximum keyboard-mode velocity change rate.",
+    )
+    parser.add_argument(
+        "--keyboard-yaw-acceleration-dps2",
+        type=float,
+        default=120.0,
+        help="Maximum keyboard-mode yaw-rate change rate.",
+    )
+    parser.add_argument(
         "--start-as-scene-origin",
         action="store_true",
         help=(
@@ -1149,6 +1263,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ground-z-ned", type=float, default=0.0)
     parser.add_argument("--waypoint-spacing-m", type=float, default=3.0)
     parser.add_argument(
+        "--velocity-command-duration-sec",
+        type=float,
+        default=0.1,
+        help="Duration of each PX4 velocity setpoint in velocity flight mode.",
+    )
+    parser.add_argument(
+        "--acceleration-limit-mps2",
+        type=float,
+        default=2.0,
+        help="Maximum velocity change rate in velocity flight mode.",
+    )
+    parser.add_argument(
+        "--slowdown-distance-m",
+        type=float,
+        default=4.0,
+        help="Distance over which velocity mode eases down near each waypoint.",
+    )
+    parser.add_argument(
         "--flight-driver",
         choices=["velocity", "path-api"],
         default="velocity",
@@ -1158,11 +1290,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--waypoint-acceptance-m", type=float, default=1.0)
+    parser.set_defaults(face_travel_direction=False)
+    parser.add_argument(
+        "--face-travel-direction",
+        dest="face_travel_direction",
+        action="store_true",
+        help="Yaw toward each waypoint in velocity/path flight modes.",
+    )
     parser.add_argument(
         "--no-face-travel-direction",
         dest="face_travel_direction",
         action="store_false",
-        default=True,
         help="Keep the existing yaw instead of yawing toward each waypoint.",
     )
     parser.add_argument("--lookahead-m", type=float, default=-1.0)
