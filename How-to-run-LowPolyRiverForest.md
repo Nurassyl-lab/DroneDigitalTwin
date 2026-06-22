@@ -121,3 +121,13 @@ python check_all_cameras.py `
    --depth-min-m 0.1 `
    --depth-max-m 80
 ```
+
+```python
+python check_all_cameras.py `
+  --camera lidar `
+  --fly-pattern `
+  --avoid-obstacles `
+  --teleport-start `
+  --start 0,0,-28 `
+  --lidar-quality-preset dense-forward
+```
