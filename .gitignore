@@ -398,3 +398,6 @@ client/python/example_user_scripts/riverside_forest_3d.png
 client/python/example_user_scripts/riverside_forest.png
 px4_flight_trace.png
 client/python/example_user_scripts/sim_config/*_runtime_start.jsonc
+
+# Video
+*.mp4
