@@ -1302,8 +1302,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=20.0,
         help="If no waypoint/goal is supplied, place one this many meters ahead.",
     )
-    parser.add_argument("--preview-width", type=int, default=1280)
-    parser.add_argument("--preview-height", type=int, default=720)
+    parser.add_argument("--preview-width", type=int, default=848)
+    parser.add_argument("--preview-height", type=int, default=480)
     parser.add_argument("--duration-sec", type=float, default=0.0)
     parser.add_argument("--first-frame-timeout-sec", type=float, default=20.0)
     parser.add_argument("--report-every-sec", type=float, default=2.0)
