@@ -1347,8 +1347,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--path-yaw-rate-dps",
         type=float,
-        default=15.0,
-        help="Maximum yaw rate used by --face-travel-direction.",
+        default=30.0,
+        help="Maximum yaw rate used while facing the planned route.",
     )
     parser.add_argument(
         "--move-timeout-sec",
@@ -1356,12 +1356,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=45.0,
         help="Per-waypoint movement timeout while following the planned route.",
     )
-    parser.set_defaults(face_travel_direction=False)
+    parser.set_defaults(face_travel_direction=True)
     parser.add_argument(
         "--face-travel-direction",
         dest="face_travel_direction",
         action="store_true",
-        help="Yaw toward each planned waypoint while flying.",
+        help="Yaw toward each planned waypoint while flying. Enabled by default.",
     )
     parser.add_argument(
         "--no-face-travel-direction",
