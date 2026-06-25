@@ -133,6 +133,7 @@ python check_all_cameras.py `
 ```
 
 ### How to use FPV route overlay in the River-side Forest environment
+0. in `./DroneDigitalTwin` root folder, run `mkdir video`
 1. Open the River-side ForestDomeEnv.uproject in Unreal Engine Editor and press play button
 2. Run PX4 using `make px4_sitl_default none_iris`
 3. Run
@@ -164,7 +165,10 @@ python fpv_route_overlay.py `
   --slowdown-distance-m 1 `
   --waypoint-acceptance-m 1.5 `
   --waypoint-hold-sec 0 `
-  --path-yaw-rate-dps 10
+  --path-yaw-rate-dps 10 `
+  --video-path "path/DroneDigitalTwin/video/" `
+  --preview-height 1080 `
+  --preview-width 1920
 ```
 
 - Short-path: start at "72,-8,-4" and goal at "33, -19, -6"
