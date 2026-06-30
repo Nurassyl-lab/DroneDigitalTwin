@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import commentjson
 
 from projectairsim import Drone, ProjectAirSimClient, World
+from projectairsim.drone import YawControlMode
 from projectairsim.planners import AStarPlanner
 from projectairsim.types import Pose, Quaternion, Vector3
 from projectairsim.utils import (
@@ -40,14 +41,17 @@ sys.path.append(
 
 from px4_astar_autopilot import (
     brake_to_stop_by_velocity,
+    clamp,
     fly_path_by_velocity,
     fly_to_point_by_velocity,
     hold_waypoint_by_velocity,
     infer_map_center,
     infer_map_size,
+    limit_vector_delta,
     parse_size3,
     sparsify_path,
     validate_grid_coordinate,
+    wrap_angle_rad,
 )
 
 
@@ -1165,6 +1169,119 @@ def get_pose_position_ned(drone: Drone) -> List[float]:
     return [float(position["x"]), float(position["y"]), float(position["z"])]
 
 
+def yaw_from_quaternion(rotation) -> float:
+    w = float(rotation["w"])
+    x = float(rotation["x"])
+    y = float(rotation["y"])
+    z = float(rotation["z"])
+    return math.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+
+
+def get_pose_yaw_ned(drone: Drone) -> float:
+    pose = drone.get_ground_truth_kinematics()["pose"]
+    rotation = pose.get("orientation") or pose.get("rotation")
+    if rotation is None:
+        return 0.0
+    return yaw_from_quaternion(rotation)
+
+
+async def request_px4_control(drone: Drone):
+    projectairsim_log().info("Requesting PX4 control for direct movement")
+    request_control_task = await drone.request_control_async()
+    await request_control_task
+
+
+def closest_route_progress(
+    path: Sequence[Sequence[float]],
+    position: Sequence[float],
+) -> Tuple[float, int]:
+    if len(path) < 2:
+        return 0.0, 0
+
+    best_distance_sq = math.inf
+    best_progress_m = 0.0
+    best_segment_index = 0
+    traveled_m = 0.0
+
+    for index in range(1, len(path)):
+        start = path[index - 1]
+        end = path[index]
+        segment = [end[axis] - start[axis] for axis in range(3)]
+        segment_length_sq = sum(component * component for component in segment)
+        segment_length_m = math.sqrt(segment_length_sq)
+
+        if segment_length_sq <= 1e-9:
+            fraction = 0.0
+            closest = [float(start[axis]) for axis in range(3)]
+        else:
+            offset = [position[axis] - start[axis] for axis in range(3)]
+            fraction = clamp(
+                sum(offset[axis] * segment[axis] for axis in range(3))
+                / segment_length_sq,
+                0.0,
+                1.0,
+            )
+            closest = [
+                float(start[axis]) + segment[axis] * fraction
+                for axis in range(3)
+            ]
+
+        distance_sq = sum((position[axis] - closest[axis]) ** 2 for axis in range(3))
+        if distance_sq < best_distance_sq:
+            best_distance_sq = distance_sq
+            best_progress_m = traveled_m + segment_length_m * fraction
+            best_segment_index = index - 1
+
+        traveled_m += segment_length_m
+
+    return best_progress_m, best_segment_index
+
+
+def next_route_waypoint_index(
+    path: Sequence[Sequence[float]],
+    position: Sequence[float],
+) -> int:
+    if len(path) <= 1:
+        return 0
+
+    progress_m, _ = closest_route_progress(path, position)
+    route_distances = cumulative_route_distances(path)
+    for index in range(1, len(route_distances)):
+        if route_distances[index] > progress_m + 1e-3:
+            return index
+    return len(path) - 1
+
+
+def segment_lookahead_point(
+    start: Sequence[float],
+    end: Sequence[float],
+    position: Sequence[float],
+    lookahead_m: float,
+) -> List[float]:
+    segment = [float(end[axis]) - float(start[axis]) for axis in range(3)]
+    segment_length_sq = sum(component * component for component in segment)
+    if segment_length_sq <= 1e-9 or lookahead_m <= 0.0:
+        return [float(end[0]), float(end[1]), float(end[2])]
+
+    offset = [float(position[axis]) - float(start[axis]) for axis in range(3)]
+    projection_fraction = clamp(
+        sum(offset[axis] * segment[axis] for axis in range(3))
+        / segment_length_sq,
+        0.0,
+        1.0,
+    )
+    segment_length_m = math.sqrt(segment_length_sq)
+    lookahead_fraction = lookahead_m / max(segment_length_m, 1e-6)
+    return interpolate_point(
+        start,
+        end,
+        min(1.0, projection_fraction + lookahead_fraction),
+    )
+
+
 def make_default_waypoint_ahead(drone: Drone, distance_m: float) -> Waypoint:
     pose = drone.get_ground_truth_kinematics()["pose"]
     position = pose["position"]
@@ -1709,15 +1826,13 @@ def refresh_dynamic_route_visuals(
     plot_world_waypoint_markers(world, waypoints, args)
 
 
-async def maybe_replan_active_route(
+def scan_active_route_for_obstacle(
     world: World,
-    drone: Drone,
     args,
     active_path: Sequence[Sequence[float]],
     waypoint_index: int,
     current_position: Sequence[float],
-    commanded_velocity: Sequence[float],
-) -> Tuple[List[List[float]], int, Optional[StaticRouteObstacle], List[float]]:
+) -> Optional[StaticRouteObstacle]:
     lookahead_path = lookahead_route_from_current(
         active_path,
         waypoint_index,
@@ -1725,7 +1840,7 @@ async def maybe_replan_active_route(
         args.dynamic_replan_lookahead_waypoints,
     )
     if len(lookahead_path) < 2:
-        return list(active_path), waypoint_index, None, list(commanded_velocity)
+        return None
 
     lookahead_scan = create_static_route_scan(
         world,
@@ -1739,6 +1854,50 @@ async def maybe_replan_active_route(
         args,
         lookahead_path,
         log_clear=False,
+    )
+    return obstacle
+
+
+def build_dynamic_rerouted_path(
+    world: World,
+    args,
+    active_path: Sequence[Sequence[float]],
+    waypoint_index: int,
+    current_position: Sequence[float],
+    obstacle: StaticRouteObstacle,
+) -> List[List[float]]:
+    remaining_path = remaining_route_from_current(
+        active_path,
+        waypoint_index,
+        current_position,
+    )
+    obstacle.stop_point = [float(value) for value in current_position]
+    obstacle.stop_distance_m = 0.0
+    replan_scan_path = list(remaining_path)
+    if args.replan_emergency_node is not None:
+        append_unique_point(replan_scan_path, args.replan_emergency_node)
+    route_scan = create_static_route_scan(world, args, replan_scan_path)
+    rerouted_path = build_rerouted_path(route_scan, args, remaining_path, obstacle)
+    if args.dynamic_replan_max_segment_m > 0.0:
+        rerouted_path = densify_path(rerouted_path, args.dynamic_replan_max_segment_m)
+    return rerouted_path
+
+
+async def maybe_replan_active_route(
+    world: World,
+    drone: Drone,
+    args,
+    active_path: Sequence[Sequence[float]],
+    waypoint_index: int,
+    current_position: Sequence[float],
+    commanded_velocity: Sequence[float],
+) -> Tuple[List[List[float]], int, Optional[StaticRouteObstacle], List[float]]:
+    obstacle = scan_active_route_for_obstacle(
+        world,
+        args,
+        active_path,
+        waypoint_index,
+        current_position,
     )
     if obstacle is None:
         return list(active_path), waypoint_index, None, list(commanded_velocity)
@@ -1767,25 +1926,147 @@ async def maybe_replan_active_route(
         )
 
     current_position = get_pose_position_ned(drone)
-
-    remaining_path = remaining_route_from_current(
+    rerouted_path = build_dynamic_rerouted_path(
+        world,
+        args,
         active_path,
         waypoint_index,
         current_position,
+        obstacle,
     )
-    obstacle.stop_point = [float(value) for value in current_position]
-    obstacle.stop_distance_m = 0.0
-    replan_scan_path = list(remaining_path)
-    if args.replan_emergency_node is not None:
-        append_unique_point(replan_scan_path, args.replan_emergency_node)
-    route_scan = create_static_route_scan(world, args, replan_scan_path)
-    rerouted_path = build_rerouted_path(route_scan, args, remaining_path, obstacle)
-    if args.dynamic_replan_max_segment_m > 0.0:
-        rerouted_path = densify_path(rerouted_path, args.dynamic_replan_max_segment_m)
     return rerouted_path, 1, obstacle, commanded_velocity
 
 
-async def fly_path_with_dynamic_replanning(
+async def fly_one_waypoint_smooth(
+    world: World,
+    drone: Drone,
+    args,
+    active_path: Sequence[Sequence[float]],
+    waypoint_index: int,
+    commanded_velocity: Sequence[float],
+    replan_count: int,
+) -> Tuple[List[List[float]], int, List[float], Optional[StaticRouteObstacle]]:
+    target = active_path[waypoint_index]
+    previous_target = active_path[max(0, waypoint_index - 1)]
+    is_final_waypoint = waypoint_index == len(active_path) - 1
+    command_duration_sec = max(0.05, args.velocity_command_duration_sec)
+    max_velocity_delta = max(0.0, args.acceleration_limit_mps2) * command_duration_sec
+    max_yaw_rate_radps = math.radians(max(0.0, args.path_yaw_rate_dps))
+    slowdown_distance_m = max(args.waypoint_acceptance_m, args.slowdown_distance_m)
+    velocity_lookahead_m = max(0.0, args.velocity_lookahead_m)
+    started_at = time.time()
+    last_report_at = 0.0
+    velocity = [
+        float(commanded_velocity[0]),
+        float(commanded_velocity[1]),
+        float(commanded_velocity[2]),
+    ]
+
+    while True:
+        current = get_pose_position_ned(drone)
+        distance = distance_between(current, target)
+        if distance <= args.waypoint_acceptance_m:
+            if is_final_waypoint:
+                velocity = await brake_to_stop_by_velocity(
+                    drone,
+                    velocity,
+                    command_duration_sec,
+                    max_velocity_delta,
+                )
+            projectairsim_log().info(
+                "Waypoint %03d reached target %s; pose NED %s; error %.2f m",
+                waypoint_index,
+                format_vector3(target),
+                format_vector3(current),
+                distance,
+            )
+            return list(active_path), waypoint_index + 1, velocity, None
+
+        elapsed = time.time() - started_at
+        if args.move_timeout_sec > 0 and elapsed > args.move_timeout_sec:
+            drone.cancel_last_task()
+            raise RuntimeError(
+                f"Waypoint {waypoint_index:03d} timed out after "
+                f"{args.move_timeout_sec:.1f}s; target {format_vector3(target)}, "
+                f"pose NED {format_vector3(current)}, remaining {distance:.2f} m"
+            )
+
+        if (
+            args.replan_on_object
+            and replan_count < args.dynamic_replan_max_count
+            and elapsed >= args.dynamic_replan_min_flight_sec
+        ):
+            new_path, new_index, obstacle, velocity = await maybe_replan_active_route(
+                world,
+                drone,
+                args,
+                active_path,
+                waypoint_index,
+                current,
+                velocity,
+            )
+            if obstacle is not None:
+                return new_path, new_index, velocity, obstacle
+
+        if elapsed - last_report_at >= args.report_every_sec:
+            projectairsim_log().info(
+                "Waypoint %03d moving toward %s; pose NED %s; remaining %.2f m",
+                waypoint_index,
+                format_vector3(target),
+                format_vector3(current),
+                distance,
+            )
+            last_report_at = elapsed
+
+        steering_target = segment_lookahead_point(
+            previous_target,
+            target,
+            current,
+            velocity_lookahead_m,
+        )
+        if is_final_waypoint and distance <= slowdown_distance_m:
+            steering_target = target
+        steering_distance = distance_between(current, steering_target)
+        if steering_distance <= 1e-6:
+            steering_target = target
+            steering_distance = distance
+
+        delta = [steering_target[idx] - current[idx] for idx in range(3)]
+        speed_scale = 1.0
+        if is_final_waypoint:
+            speed_scale = min(1.0, max(0.2, distance / slowdown_distance_m))
+        desired_speed = min(args.velocity_mps, steering_distance / command_duration_sec)
+        desired_speed *= speed_scale
+        desired_velocity = [
+            (component / steering_distance) * desired_speed
+            for component in delta
+        ]
+        velocity = limit_vector_delta(velocity, desired_velocity, max_velocity_delta)
+
+        yaw_rate_radps = 0.0
+        horizontal_speed = math.hypot(velocity[0], velocity[1])
+        if args.face_travel_direction and horizontal_speed > 0.05 and max_yaw_rate_radps > 0.0:
+            desired_yaw = math.atan2(velocity[1], velocity[0])
+            yaw_error = wrap_angle_rad(desired_yaw - get_pose_yaw_ned(drone))
+            yaw_rate_radps = clamp(
+                yaw_error / command_duration_sec,
+                -max_yaw_rate_radps,
+                max_yaw_rate_radps,
+            )
+
+        await drone.move_by_velocity_async(
+            v_north=velocity[0],
+            v_east=velocity[1],
+            v_down=velocity[2],
+            duration=command_duration_sec,
+            yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
+            yaw_is_rate=True,
+            yaw=yaw_rate_radps,
+        )
+        await asyncio.sleep(command_duration_sec)
+
+
+async def fly_path_with_dynamic_replanning_velocity(
     world: World,
     drone: Drone,
     path: List[List[float]],
@@ -1803,66 +2084,291 @@ async def fly_path_with_dynamic_replanning(
     skipped_display_points = []
 
     while waypoint_index < len(active_path):
-        current = get_pose_position_ned(drone)
-        if args.replan_on_object and replan_count < args.dynamic_replan_max_count:
-            new_path, new_index, obstacle, commanded_velocity = await maybe_replan_active_route(
+        active_path, waypoint_index, commanded_velocity, obstacle = (
+            await fly_one_waypoint_smooth(
                 world,
                 drone,
                 args,
                 active_path,
                 waypoint_index,
-                current,
                 commanded_velocity,
+                replan_count,
             )
-            if obstacle is not None:
-                replan_count += 1
-                active_path = new_path
-                waypoint_index = new_index
-                for point in obstacle.skipped_points or []:
-                    append_unique_point(skipped_display_points, point)
-                refresh_dynamic_route_visuals(
-                    world,
-                    display,
-                    active_path,
-                    args,
-                    skipped_display_points,
-                )
-                projectairsim_log().warning(
-                    "Dynamic reroute %d/%d built while flying. Continuing via "
-                    "%d active waypoint(s).",
-                    replan_count,
-                    args.dynamic_replan_max_count,
-                    len(active_path),
-                )
-                continue
-
-        target = active_path[waypoint_index]
-        is_final_waypoint = waypoint_index == len(active_path) - 1
-        should_hold = args.waypoint_hold_sec > 0.0 and not is_final_waypoint
-        commanded_velocity = await fly_to_point_by_velocity(
-            drone,
-            target,
-            args.velocity_mps,
-            args.waypoint_acceptance_m,
-            args.move_timeout_sec,
-            args.report_every_sec,
-            args.face_travel_direction,
-            f"Waypoint {waypoint_index:03d}",
-            args.velocity_command_duration_sec,
-            args.acceleration_limit_mps2,
-            args.slowdown_distance_m,
-            args.path_yaw_rate_dps,
-            commanded_velocity,
-            is_final_waypoint or should_hold,
-            False,
-            None,
-            None,
         )
-        if should_hold:
-            await asyncio.sleep(args.waypoint_hold_sec)
-        waypoint_index += 1
+        if obstacle is not None:
+            replan_count += 1
+            for point in obstacle.skipped_points or []:
+                append_unique_point(skipped_display_points, point)
+            refresh_dynamic_route_visuals(
+                world,
+                display,
+                active_path,
+                args,
+                skipped_display_points,
+            )
+            projectairsim_log().warning(
+                "Dynamic reroute %d/%d built while flying. Continuing via "
+                "%d active waypoint(s).",
+                replan_count,
+                args.dynamic_replan_max_count,
+                len(active_path),
+            )
+            continue
+
+        if args.waypoint_hold_sec > 0.0 and waypoint_index < len(active_path):
+            await hold_waypoint_by_velocity(
+                drone,
+                args.waypoint_hold_sec,
+                args.velocity_command_duration_sec,
+                f"Waypoint {waypoint_index - 1:03d}",
+                None,
+                None,
+            )
 
     return active_path, replan_count
+
+
+def infer_path_timeout_sec(path: Sequence[Sequence[float]], args) -> float:
+    if args.path_timeout_sec > 0:
+        return args.path_timeout_sec
+    return max(
+        args.move_timeout_sec,
+        calculate_path_length(path) / max(args.velocity_mps, 0.1) * 3.0,
+    )
+
+
+async def start_move_on_path_task(
+    drone: Drone,
+    path: Sequence[Sequence[float]],
+    args,
+    label: str,
+) -> Tuple[asyncio.Task, float]:
+    await request_px4_control(drone)
+    path_to_follow = [
+        [float(point[0]), float(point[1]), float(point[2])]
+        for point in path
+    ]
+    path_timeout_sec = infer_path_timeout_sec(path_to_follow, args)
+    projectairsim_log().info(
+        "%s using MoveOnPath path-api: %d waypoint(s), %.2fm length, "
+        "velocity %.2fm/s, lookahead %.2f, adaptive lookahead %.2f",
+        label,
+        len(path_to_follow),
+        calculate_path_length(path_to_follow),
+        args.velocity_mps,
+        args.lookahead_m,
+        args.adaptive_lookahead,
+    )
+    path_task = await drone.move_on_path_async(
+        path_to_follow,
+        velocity=args.velocity_mps,
+        timeout_sec=path_timeout_sec,
+        yaw_control_mode=(
+            YawControlMode.ForwardOnly
+            if args.face_travel_direction
+            else YawControlMode.MaxDegreeOfFreedom
+        ),
+        yaw_is_rate=not args.face_travel_direction,
+        yaw=0.0,
+        lookahead=args.lookahead_m,
+        adaptive_lookahead=args.adaptive_lookahead,
+    )
+    return path_task, path_timeout_sec
+
+
+async def finish_cancelled_path_task(task: asyncio.Task, label: str) -> None:
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+    except asyncio.TimeoutError:
+        projectairsim_log().info("%s cancel is still settling; continuing", label)
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        projectairsim_log().info("%s ended during cancel: %s", label, exc)
+
+
+async def fly_path_by_path_api(
+    drone: Drone,
+    path: Sequence[Sequence[float]],
+    args,
+    label: str = "Follow waypoint path",
+) -> None:
+    path_task, path_timeout_sec = await start_move_on_path_task(
+        drone,
+        path,
+        args,
+        label,
+    )
+    await await_drone_task(
+        drone,
+        path_task,
+        label,
+        path_timeout_sec + 5.0,
+        args.report_every_sec,
+    )
+
+
+async def fly_path_with_dynamic_replanning_path_api(
+    world: World,
+    drone: Drone,
+    path: List[List[float]],
+    args,
+    display: Optional[FpvWaypointOverlayDisplay] = None,
+) -> Tuple[List[List[float]], int]:
+    active_path = (
+        densify_path(path, args.dynamic_replan_max_segment_m)
+        if args.dynamic_replan_max_segment_m > 0.0
+        else [[float(point[0]), float(point[1]), float(point[2])] for point in path]
+    )
+    replan_count = 0
+    skipped_display_points = []
+    check_interval_sec = max(0.1, args.dynamic_replan_check_sec)
+
+    while True:
+        label = (
+            "Follow dynamic route"
+            if replan_count == 0
+            else f"Follow rerouted path {replan_count}"
+        )
+        path_task, path_timeout_sec = await start_move_on_path_task(
+            drone,
+            active_path,
+            args,
+            label,
+        )
+        started_at = time.time()
+        last_report_at = started_at
+        last_check_at = 0.0
+        obstacle = None
+
+        while not path_task.done():
+            now = time.time()
+            elapsed = now - started_at
+            current = get_pose_position_ned(drone)
+
+            if path_timeout_sec > 0 and elapsed > path_timeout_sec:
+                drone.cancel_last_task()
+                raise RuntimeError(
+                    f"{label} timed out after {path_timeout_sec:.1f}s at pose "
+                    f"{format_vector3(current)}"
+                )
+
+            can_replan = (
+                args.replan_on_object
+                and replan_count < args.dynamic_replan_max_count
+                and elapsed >= args.dynamic_replan_min_flight_sec
+            )
+            if can_replan and now - last_check_at >= check_interval_sec:
+                waypoint_index = next_route_waypoint_index(active_path, current)
+                obstacle = scan_active_route_for_obstacle(
+                    world,
+                    args,
+                    active_path,
+                    waypoint_index,
+                    current,
+                )
+                last_check_at = now
+                if obstacle is not None:
+                    projectairsim_log().warning(
+                        "Object on path detected on the next route leg at NED %s. "
+                        "Stopping path-api flight before live replanning.",
+                        format_vector3(obstacle.obstacle_point),
+                    )
+                    drone.cancel_last_task()
+                    await finish_cancelled_path_task(path_task, label)
+                    command_duration_sec = max(0.05, args.velocity_command_duration_sec)
+                    hold_sec = max(
+                        args.dynamic_replan_stop_hold_sec,
+                        command_duration_sec,
+                    )
+                    await hold_waypoint_by_velocity(
+                        drone,
+                        hold_sec,
+                        command_duration_sec,
+                        "Dynamic replan stop",
+                        None,
+                        None,
+                    )
+
+                    current = get_pose_position_ned(drone)
+                    active_path = build_dynamic_rerouted_path(
+                        world,
+                        args,
+                        active_path,
+                        waypoint_index,
+                        current,
+                        obstacle,
+                    )
+                    replan_count += 1
+                    for point in obstacle.skipped_points or []:
+                        append_unique_point(skipped_display_points, point)
+                    refresh_dynamic_route_visuals(
+                        world,
+                        display,
+                        active_path,
+                        args,
+                        skipped_display_points,
+                    )
+                    projectairsim_log().warning(
+                        "Dynamic reroute %d/%d built while flying. Continuing "
+                        "with MoveOnPath via %d active waypoint(s).",
+                        replan_count,
+                        args.dynamic_replan_max_count,
+                        len(active_path),
+                    )
+                    break
+
+            if now - last_report_at >= args.report_every_sec:
+                waypoint_index = next_route_waypoint_index(active_path, current)
+                projectairsim_log().info(
+                    "%s running after %.1fs; pose NED %s; next waypoint %03d",
+                    label,
+                    elapsed,
+                    format_vector3(current),
+                    waypoint_index,
+                )
+                last_report_at = now
+
+            await asyncio.sleep(min(0.25, check_interval_sec))
+
+        if obstacle is not None:
+            continue
+
+        result = await path_task
+        current = get_pose_position_ned(drone)
+        projectairsim_log().info(
+            "%s completed with result=%s; pose NED %s",
+            label,
+            result,
+            format_vector3(current),
+        )
+        if result is False:
+            raise RuntimeError(f"{label} returned False")
+        return active_path, replan_count
+
+
+async def fly_path_with_dynamic_replanning(
+    world: World,
+    drone: Drone,
+    path: List[List[float]],
+    args,
+    display: Optional[FpvWaypointOverlayDisplay] = None,
+) -> Tuple[List[List[float]], int]:
+    if args.flight_driver == "velocity":
+        return await fly_path_with_dynamic_replanning_velocity(
+            world,
+            drone,
+            path,
+            args,
+            display,
+        )
+    return await fly_path_with_dynamic_replanning_path_api(
+        world,
+        drone,
+        path,
+        args,
+        display,
+    )
 
 
 def plot_world_waypoint_markers(world: World, waypoints: Sequence[Waypoint], args):
@@ -1931,28 +2437,45 @@ def plot_world_waypoint_markers(world: World, waypoints: Sequence[Waypoint], arg
 async def wait_for_px4_ready(drone: Drone, timeout_sec: float):
     timeout_at = time.time() + timeout_sec
     last_message = ""
+    last_ready_val = False
+    last_can_arm = False
+    last_ready_message = ""
+    last_log_time = 0.0
 
     while time.time() < timeout_at:
         state = drone.get_ready_state()
-        if state.get("ready_val") and drone.can_arm():
+        last_ready_val = bool(state.get("ready_val"))
+        last_ready_message = state.get("ready_message") or "Waiting for PX4 controller"
+        last_can_arm = drone.can_arm() if last_ready_val else False
+
+        if last_ready_val and last_can_arm:
             projectairsim_log().info("PX4 controller is connected and can arm")
             return
 
-        message = state.get("ready_message") or "Waiting for PX4 controller"
-        if state.get("ready_val"):
+        message = last_ready_message
+        if last_ready_val:
             message = (
                 "Waiting for PX4 MAVLink/GPS readiness. If PX4 says it is "
                 "waiting for simulator TCP port 4560, restart PX4 after this "
                 "scene is loaded or check PX4_SIM_HOST_ADDR/local-host-ip."
             )
-        if message != last_message:
-            projectairsim_log().info(message)
+        now = time.time()
+        if message != last_message or now - last_log_time >= 15.0:
+            remaining_sec = max(0.0, timeout_at - now)
+            projectairsim_log().info("%s (%.0fs remaining)", message, remaining_sec)
             last_message = message
+            last_log_time = now
         await asyncio.sleep(1.0)
 
     raise RuntimeError(
-        "PX4 did not become armable. Check that PX4 is running, connected to "
-        "Project AirSim on TCP port 4560, and has completed GPS/home readiness."
+        f"PX4 did not become armable after {timeout_sec:.1f}s. "
+        f"Last ready state: ready_val={last_ready_val}, "
+        f"can_arm={last_can_arm}, ready_message='{last_ready_message}'. "
+        "This happens before takeoff. Make sure the Unreal scene is already "
+        "running, then start or restart PX4 with `make px4_sitl_default "
+        "none_iris` so it can connect to Project AirSim on TCP port 4560. "
+        "If PX4 runs on another host, verify PX4_SIM_HOST_ADDR/local-host-ip "
+        "and wait for GPS/home readiness."
     )
 
 
@@ -2034,6 +2557,12 @@ async def run_overlay(args):
     has_explicit_flight_target = bool(
         args.route or args.goal is not None or args.waypoint
     )
+    if args.start_as_scene_origin and args.flight_driver == "path-api":
+        projectairsim_log().warning(
+            "--flight-driver path-api can use a different command frame than "
+            "the scene-NED debug markers when --start-as-scene-origin is used. "
+            "Use --flight-driver velocity for this demo route."
+        )
     route_path = None
     mission_path = None
     temp_config_dir = None
@@ -2152,30 +2681,57 @@ async def run_overlay(args):
                 args.report_every_sec,
             )
             if has_explicit_flight_target and not args.no_fly_to_waypoint:
-                await fly_to_point_by_velocity(
-                    drone,
-                    mission_path[0],
-                    args.velocity_mps,
-                    args.waypoint_acceptance_m,
-                    args.move_timeout_sec,
-                    args.report_every_sec,
-                    args.face_travel_direction,
-                    "Move to start",
-                    args.velocity_command_duration_sec,
-                    args.acceleration_limit_mps2,
-                    args.slowdown_distance_m,
-                    args.path_yaw_rate_dps,
-                    None,
-                    True,
-                    True,
-                    None,
-                    None,
-                )
+                if args.flight_driver == "path-api":
+                    await request_px4_control(drone)
+                    start_task = await drone.move_to_position_async(
+                        north=mission_path[0][0],
+                        east=mission_path[0][1],
+                        down=mission_path[0][2],
+                        velocity=args.velocity_mps,
+                        timeout_sec=args.move_timeout_sec,
+                        yaw_control_mode=(
+                            YawControlMode.ForwardOnly
+                            if args.face_travel_direction
+                            else YawControlMode.MaxDegreeOfFreedom
+                        ),
+                        yaw_is_rate=not args.face_travel_direction,
+                        yaw=0.0,
+                        lookahead=args.lookahead_m,
+                        adaptive_lookahead=args.adaptive_lookahead,
+                    )
+                    await await_drone_task(
+                        drone,
+                        start_task,
+                        "Move to start",
+                        args.move_timeout_sec + 5.0,
+                        args.report_every_sec,
+                    )
+                else:
+                    await fly_to_point_by_velocity(
+                        drone,
+                        mission_path[0],
+                        args.velocity_mps,
+                        args.waypoint_acceptance_m,
+                        args.move_timeout_sec,
+                        args.report_every_sec,
+                        args.face_travel_direction,
+                        "Move to start",
+                        args.velocity_command_duration_sec,
+                        args.acceleration_limit_mps2,
+                        args.slowdown_distance_m,
+                        args.path_yaw_rate_dps,
+                        None,
+                        True,
+                        True,
+                        None,
+                        None,
+                    )
                 if args.replan_on_object:
                     projectairsim_log().info(
                         "Dynamic route replanning is enabled. The drone will "
-                        "scan ahead while flying and splice in an A* bypass if "
-                        "the route is blocked."
+                        "scan ahead while flying with %s and splice in an A* "
+                        "bypass if the route is blocked.",
+                        args.flight_driver,
                     )
                     mission_path, replan_count = await fly_path_with_dynamic_replanning(
                         world,
@@ -2190,22 +2746,25 @@ async def run_overlay(args):
                             replan_count,
                         )
                 else:
-                    await fly_path_by_velocity(
-                        drone,
-                        mission_path,
-                        args.velocity_mps,
-                        args.waypoint_acceptance_m,
-                        args.move_timeout_sec,
-                        args.report_every_sec,
-                        args.face_travel_direction,
-                        args.velocity_command_duration_sec,
-                        args.acceleration_limit_mps2,
-                        args.slowdown_distance_m,
-                        args.waypoint_hold_sec,
-                        args.path_yaw_rate_dps,
-                        None,
-                        None,
-                    )
+                    if args.flight_driver == "path-api":
+                        await fly_path_by_path_api(drone, mission_path, args)
+                    else:
+                        await fly_path_by_velocity(
+                            drone,
+                            mission_path,
+                            args.velocity_mps,
+                            args.waypoint_acceptance_m,
+                            args.move_timeout_sec,
+                            args.report_every_sec,
+                            args.face_travel_direction,
+                            args.velocity_command_duration_sec,
+                            args.acceleration_limit_mps2,
+                            args.slowdown_distance_m,
+                            args.waypoint_hold_sec,
+                            args.path_yaw_rate_dps,
+                            None,
+                            None,
+                        )
                 projectairsim_log().info(
                     "Reached route destination %s",
                     mission_path[-1],
@@ -2368,7 +2927,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--takeoff-timeout-sec", type=float, default=20.0)
     parser.add_argument("--land-timeout-sec", type=float, default=30.0)
     parser.add_argument("--arm-timeout-sec", type=float, default=60.0)
-    parser.add_argument("--px4-ready-timeout-sec", type=float, default=60.0)
+    parser.add_argument(
+        "--px4-ready-timeout-sec",
+        type=float,
+        default=300.0,
+        help="Seconds to wait for PX4 to connect, finish GPS/home readiness, and become armable.",
+    )
     parser.add_argument("--velocity-mps", type=float, default=2.0)
     parser.add_argument("--resolution-m", type=float, default=1.0)
     parser.add_argument("--map-center", type=parse_vector3)
@@ -2425,6 +2989,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Seconds to hover after detecting an object and before planning bypass.",
+    )
+    parser.add_argument(
+        "--dynamic-replan-min-flight-sec",
+        type=float,
+        default=0.5,
+        help="Minimum time to fly toward a waypoint before checking for live reroute.",
+    )
+    parser.add_argument(
+        "--dynamic-replan-check-sec",
+        type=float,
+        default=0.5,
+        help="Seconds between live obstacle checks while the path API is flying.",
     )
     parser.add_argument(
         "--dynamic-replan-detection-margin-m",
@@ -2567,13 +3143,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--velocity-command-duration-sec",
         type=float,
         default=0.1,
-        help="Duration of each PX4 velocity setpoint while following waypoints.",
+        help=(
+            "Duration of each PX4 velocity setpoint in velocity mode and while "
+            "holding for live replans."
+        ),
     )
     parser.add_argument(
         "--acceleration-limit-mps2",
         type=float,
-        default=2.0,
-        help="Maximum velocity change rate while following waypoints.",
+        default=1.0,
+        help="Maximum velocity change rate in velocity flight mode.",
+    )
+    parser.add_argument(
+        "--velocity-lookahead-m",
+        type=float,
+        default=8.0,
+        help=(
+            "Distance ahead on the current route segment used by velocity mode. "
+            "This prevents side-to-side waypoint-center chasing."
+        ),
     )
     parser.add_argument(
         "--slowdown-distance-m",
@@ -2593,6 +3181,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=45.0,
         help="Per-waypoint movement timeout while following the planned route.",
     )
+    parser.add_argument(
+        "--path-timeout-sec",
+        type=float,
+        default=0.0,
+        help="MoveOnPath timeout. Use 0 to infer from path length and velocity.",
+    )
+    parser.add_argument(
+        "--flight-driver",
+        choices=["path-api", "velocity"],
+        default="velocity",
+        help=(
+            "Use the PX4 offboard velocity route follower, or Project AirSim's "
+            "MoveOnPath path API. The velocity driver matches scene-NED routes "
+            "used with --start-as-scene-origin."
+        ),
+    )
     parser.set_defaults(face_travel_direction=True)
     parser.add_argument(
         "--face-travel-direction",
@@ -2605,6 +3209,18 @@ def build_parser() -> argparse.ArgumentParser:
         dest="face_travel_direction",
         action="store_false",
         help="Keep existing yaw while flying the planned route.",
+    )
+    parser.add_argument(
+        "--lookahead-m",
+        type=float,
+        default=-1.0,
+        help="MoveOnPath lookahead distance. Use -1 for automatic lookahead.",
+    )
+    parser.add_argument(
+        "--adaptive-lookahead",
+        type=float,
+        default=1.0,
+        help="MoveOnPath adaptive lookahead setting.",
     )
     parser.add_argument(
         "--skip-takeoff",
