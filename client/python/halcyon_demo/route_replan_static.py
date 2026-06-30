@@ -1952,8 +1952,15 @@ async def fly_one_waypoint_smooth(
     command_duration_sec = max(0.05, args.velocity_command_duration_sec)
     max_velocity_delta = max(0.0, args.acceleration_limit_mps2) * command_duration_sec
     max_yaw_rate_radps = math.radians(max(0.0, args.path_yaw_rate_dps))
+    yaw_deadband_rad = math.radians(max(0.0, args.path_yaw_deadband_deg))
+    yaw_response_sec = max(command_duration_sec, args.path_yaw_response_sec)
     slowdown_distance_m = max(args.waypoint_acceptance_m, args.slowdown_distance_m)
     velocity_lookahead_m = max(0.0, args.velocity_lookahead_m)
+    segment_delta = [
+        float(target[0]) - float(previous_target[0]),
+        float(target[1]) - float(previous_target[1]),
+    ]
+    segment_has_heading = math.hypot(segment_delta[0], segment_delta[1]) > 0.1
     started_at = time.time()
     last_report_at = 0.0
     velocity = [
@@ -2045,14 +2052,24 @@ async def fly_one_waypoint_smooth(
 
         yaw_rate_radps = 0.0
         horizontal_speed = math.hypot(velocity[0], velocity[1])
-        if args.face_travel_direction and horizontal_speed > 0.05 and max_yaw_rate_radps > 0.0:
-            desired_yaw = math.atan2(velocity[1], velocity[0])
+        if (
+            args.face_travel_direction
+            and segment_has_heading
+            and horizontal_speed > 0.05
+            and max_yaw_rate_radps > 0.0
+        ):
+            desired_yaw = math.atan2(segment_delta[1], segment_delta[0])
             yaw_error = wrap_angle_rad(desired_yaw - get_pose_yaw_ned(drone))
-            yaw_rate_radps = clamp(
-                yaw_error / command_duration_sec,
-                -max_yaw_rate_radps,
-                max_yaw_rate_radps,
-            )
+            if abs(yaw_error) > yaw_deadband_rad:
+                yaw_error_to_close = math.copysign(
+                    abs(yaw_error) - yaw_deadband_rad,
+                    yaw_error,
+                )
+                yaw_rate_radps = clamp(
+                    yaw_error_to_close / yaw_response_sec,
+                    -max_yaw_rate_radps,
+                    max_yaw_rate_radps,
+                )
 
         await drone.move_by_velocity_async(
             v_north=velocity[0],
@@ -3172,8 +3189,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--path-yaw-rate-dps",
         type=float,
-        default=30.0,
-        help="Maximum yaw rate used while facing the planned route.",
+        default=10.0,
+        help="Maximum yaw rate used while facing the planned route segment.",
+    )
+    parser.add_argument(
+        "--path-yaw-deadband-deg",
+        type=float,
+        default=5.0,
+        help="Yaw error ignored while facing the planned route segment.",
+    )
+    parser.add_argument(
+        "--path-yaw-response-sec",
+        type=float,
+        default=1.5,
+        help="Seconds over which route-facing yaw tries to close heading error.",
     )
     parser.add_argument(
         "--move-timeout-sec",
