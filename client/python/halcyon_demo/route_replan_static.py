@@ -2697,6 +2697,14 @@ async def run_overlay(args):
                 args.takeoff_timeout_sec + 5.0,
                 args.report_every_sec,
             )
+            # Rotate 170 degrees to the right after takeoff
+            projectairsim_log().info("Rotating 170 degrees to the right")
+            rotation_task = await drone.rotate_by_yaw_rate_async(
+                yaw_rate=math.radians(45),  # Positive = right/clockwise, in rad/s
+                duration=110.0 / 45.0  # Time needed: 170° ÷ 45°/sec ≈ 3.78 sec
+            )
+            await rotation_task
+            projectairsim_log().info("Rotation complete")
             if has_explicit_flight_target and not args.no_fly_to_waypoint:
                 if args.flight_driver == "path-api":
                     await request_px4_control(drone)
