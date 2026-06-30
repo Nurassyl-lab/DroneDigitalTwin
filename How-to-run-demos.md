@@ -1,7 +1,7 @@
 ## How to run route_replan_static.py demo
 
-1. Open the River-side ForestDomeEnv.uproject in Unreal Engine Editor and press play button
-2. Run PX4 using `make px4_sitl_default none_iris`
+1. Open the River-side ForestDomeEnv.uproject in Unreal Engine Editor and press play button.
+2. After the scene is loaded, run PX4 using `make px4_sitl_default none_iris`. If the demo waits on TCP port 4560, restart PX4 after Unreal is already playing.
 3. Run 
 
 ```python
@@ -9,21 +9,39 @@ python route_replan_static.py `
   --route "72,-8,-4; 69,-10,-40; 66,-11,-40; 63,-11,-40; 60,-12,-40; 57,-12,-40; 54,-12,-40; 51,-12,-40; 48,-12,-40; 45,-13,-40; 42,-13,-40; 39,-16,-40; 36,-17,-40; 33,-19,-6" `
   --start "72,-8,-4" `
   --start-as-scene-origin `
+  --px4-ready-timeout-sec 300 `
+  --flight-driver velocity `
+  --velocity-lookahead-m 8 `
+  --path-yaw-rate-dps 10 `
+  --path-yaw-deadband-deg 5 `
+  --path-yaw-response-sec 1.5
 ```
 
 ```python
 python route_replan_static.py `
-  --route "72.0,-8.0,-4.0; 69.93,-5.19,-5.36; 66.98,1.81,-4.61; 64.38,6.0,-4.00; 61.0,10.0,-4.5; 58.0,14.0,-5.0; 55.0,-18.0,-5.5;45.0,17.0,-16.0;28.0,25.0,-24.0;13.0,39.0,-24.0;-2.0,54.0,-24.0;-17.0,69.0,-24.0;-38.0,72.0,-25.0;-50.0,76.0,-25.0" `
+  --route "72.0,-8.0,-4.0; 69.93,-5.19,-5.36; 66.98,1.81,-4.61; 64.38,6.0,-4.00; 61.0,10.0,-4.5; 58.0,14.0,-5.0; 55.0,-18.0,-5.5;45.0,17.0,-16.0;28.0,25.0,-24.0;13.0,39.0,-24.0;-2.0,54.0,-27.0;-17.0,69.0,-27.0;-38.0,72.0,-28.0;-50.0,76.0,-25.0" `
   --start "72,-8.0,-4.0" `
   --start-as-scene-origin `
+  --px4-ready-timeout-sec 300 `
   --object-stop-distance-m 2.0 `
   --dynamic-replan-lookahead-waypoints 1 `
   --replan-rejoin-waypoints-ahead 3 `
   --dynamic-replan-max-segment-m 0 `
   --dynamic-replan-stop-hold-sec 1.0 `
+  --dynamic-replan-check-sec 0.5 `
   --replan-rejoin-point "45.0,17.0,-16.0" `
-  --replan-emergency-node "62.18,-0.41,-5.38"
+  --replan-emergency-node "62.18,-0.41,-5.38" `
+  --velocity-command-duration-sec 0.1 `
+  --acceleration-limit-mps2 1.0 `
+  --velocity-lookahead-m 8 `
+  --path-yaw-rate-dps 10 `
+  --path-yaw-deadband-deg 5 `
+  --path-yaw-response-sec 1.5 `
+  --waypoint-acceptance-m 2 `
+  --flight-driver velocity
 ```
+
+Use `--flight-driver path-api` only for experiments without `--start-as-scene-origin`; with scene-NED routes, the velocity driver keeps the route frame consistent.
 
 ## Test paths
 - short without any obstacles: `72,-8,-4; 69,-10,-40; 66,-11,-40; 63,-11,-40; 60,-12,-40; 57,-12,-40; 54,-12,-40; 51,-12,-40; 48,-12,-40; 45,-13,-40; 42,-13,-40; 39,-16,-40; 36,-17,-40; 33,-19,-6`
