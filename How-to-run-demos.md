@@ -38,7 +38,11 @@ python route_replan_static.py `
   --path-yaw-deadband-deg 5 `
   --path-yaw-response-sec 1.5 `
   --waypoint-acceptance-m 2 `
-  --flight-driver velocity
+  --flight-driver velocity `
+  --max-fps 33.33 `
+  --camera-capture-interval-sec 0.03 `
+  --preview-height 1080 `
+  --preview-height 1980
 ```
 
 Use `--flight-driver path-api` only for experiments without `--start-as-scene-origin`; with scene-NED routes, the velocity driver keeps the route frame consistent.
