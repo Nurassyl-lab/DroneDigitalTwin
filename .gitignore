@@ -402,3 +402,4 @@ client/python/example_user_scripts/sim_config/*_runtime_start.jsonc
 # Video
 *.mp4
 unreal/RealPlace
+unreal/WalkingNPCs
