@@ -42,6 +42,7 @@ class World(object):
         delay_after_load_sec: int = 0,
         sim_config_path: str = "sim_config/",
         sim_instance_idx: int = -1,
+        scene_id: str = "SceneBasicDrone",
     ):
         """ProjectAirSim World Interface.
 
@@ -51,11 +52,12 @@ class World(object):
             delay_after_load_sec (int): Time in seconds to wait after the scene is loaded
             sim_config_path (string): Relative path to search for the scene_config
             sim_instance_idx (int): the instance index of the simulation (for distributed sim only)
+            scene_id (string): scene ID to attach to when scene_config_name is empty
         """
         self.client = client
         self.sim_config_path = sim_config_path
         self.sim_instance_idx = sim_instance_idx
-        self.parent_topic = "/Sim/SceneBasicDrone"  # default-scene's ID
+        self.parent_topic = f"/Sim/{scene_id}"
 
         self.sim_config = None
         self.home_geo_point = None
@@ -482,6 +484,73 @@ class World(object):
         }
         status = self.client.request(set_obj_scale_req)
         return status
+
+    def call_actor_event(
+        self, actor_name_or_tag: str, event_name: str, params: Dict[str, float]
+    ) -> bool:
+        """Call an Unreal actor Blueprint/C++ event with one float parameter.
+
+        The actor is found by ProjectAirSim object name, partial actor name, or
+        Unreal tag. This intentionally does not move the actor transform.
+
+        Args:
+            actor_name_or_tag (str): actor name/id substring or Unreal tag
+            event_name (str): Blueprint/C++ event or function name
+            params (Dict[str, float]): one float parameter, e.g. {"NewSpeed": 0.0}
+
+        Returns:
+            bool: true if the event was found and called
+        """
+        if len(params) != 1:
+            raise ValueError("call_actor_event currently supports one float parameter")
+
+        param_name, value = next(iter(params.items()))
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("call_actor_event parameter value must be numeric")
+
+        call_actor_event_req: Dict = {
+            "method": f"{self.parent_topic}/CallActorFloatEvent",
+            "params": {
+                "actor_name_or_tag": actor_name_or_tag,
+                "event_name": event_name,
+                "param_name": param_name,
+                "value": float(value),
+            },
+            "version": 1.0,
+        }
+        return self.client.request(call_actor_event_req)
+
+    def set_actor_float_property(
+        self, actor_name_or_tag: str, property_name: str, value: float
+    ) -> bool:
+        """Set a float variable/property on an Unreal actor by reflection.
+
+        The actor is found by ProjectAirSim object name, partial actor name, or
+        Unreal tag. This is useful as a fallback when a Blueprint event is not
+        available.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("set_actor_float_property value must be numeric")
+
+        set_actor_property_req: Dict = {
+            "method": f"{self.parent_topic}/SetActorFloatProperty",
+            "params": {
+                "actor_name_or_tag": actor_name_or_tag,
+                "property_name": property_name,
+                "value": float(value),
+            },
+            "version": 1.0,
+        }
+        return self.client.request(set_actor_property_req)
+
+    def set_truck_speed(self, actor_name_or_tag: str, speed: float) -> bool:
+        """Set a BP_Truck speed through SetTruckSpeed, falling back to Speed."""
+        called = self.call_actor_event(
+            actor_name_or_tag, "SetTruckSpeed", {"NewSpeed": speed}
+        )
+        if called:
+            return True
+        return self.set_actor_float_property(actor_name_or_tag, "Speed", speed)
 
     def spawn_object(
         self,
