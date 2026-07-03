@@ -126,6 +126,14 @@ def print_live_ned(drone, last_print_at, interval_sec, force=False):
     return now
 
 
+def move_toward(current, target, max_delta):
+    if current < target:
+        return min(current + max_delta, target)
+    if current > target:
+        return max(current - max_delta, target)
+    return current
+
+
 def resolve_config_path(config_name, sim_config_path):
     path = Path(config_name)
     if path.is_absolute():
@@ -356,8 +364,30 @@ def build_parser():
     parser.add_argument("--pedestrian-stop-speed", type=float, default=0.0)
     parser.add_argument("--pedestrian-walk-speed", type=float, default=0.3)
     parser.add_argument("--pedestrian-z-speed", type=float, default=3.0)
-    parser.add_argument("--flight-speed", type=float, default=5.0)
-    parser.add_argument("--yaw-speed", type=float, default=20.0)
+    parser.add_argument(
+        "--flight-speed",
+        type=float,
+        default=5.0,
+        help="Maximum drone body-frame speed in m/s.",
+    )
+    parser.add_argument(
+        "--flight-acceleration",
+        type=float,
+        default=2.0,
+        help="How quickly drone velocity changes in m/s^2.",
+    )
+    parser.add_argument(
+        "--yaw-speed",
+        type=float,
+        default=20.0,
+        help="Maximum drone yaw rate in deg/s.",
+    )
+    parser.add_argument(
+        "--yaw-acceleration",
+        type=float,
+        default=45.0,
+        help="How quickly drone yaw rate changes in deg/s^2.",
+    )
     parser.add_argument("--command-duration-sec", type=float, default=0.1)
     parser.add_argument("--live-ned-interval-sec", type=float, default=0.5)
     parser.add_argument("--no-live-ned", action="store_true")
@@ -619,6 +649,14 @@ async def run_keyboard_control(drone, world, args):
     print(f"M: truck TargetSpeed={args.truck_move_speed:g}")
     print(f"Z: pedestrian speed={args.pedestrian_z_speed:g}")
     print(f"X: pedestrian speed={args.pedestrian_stop_speed:g}")
+    print(
+        f"Drone speed={args.flight_speed:g} m/s, "
+        f"accel={args.flight_acceleration:g} m/s^2"
+    )
+    print(
+        f"Drone yaw={args.yaw_speed:g} deg/s, "
+        f"yaw accel={args.yaw_acceleration:g} deg/s^2"
+    )
     print("L: land")
     print("Q: quit")
     if not args.no_live_ned:
@@ -631,8 +669,17 @@ async def run_keyboard_control(drone, world, args):
     m_was_pressed = False
     z_was_pressed = False
     x_was_pressed = False
+    current_vx = 0.0
+    current_vy = 0.0
+    current_vz = 0.0
+    current_yaw_rate = 0.0
+    last_control_at = time.monotonic()
 
     while keep_running:
+        now = time.monotonic()
+        dt = min(max(now - last_control_at, 0.0), 0.25)
+        last_control_at = now
+
         if not args.no_live_ned:
             last_live_ned_at = print_live_ned(
                 drone,
@@ -640,27 +687,45 @@ async def run_keyboard_control(drone, world, args):
                 args.live_ned_interval_sec,
             )
 
-        vx, vy, vz, yaw_rate = 0.0, 0.0, 0.0, 0.0
+        target_vx, target_vy, target_vz, target_yaw_rate = 0.0, 0.0, 0.0, 0.0
 
         if keyboard_module.is_pressed("w"):
-            vx = args.flight_speed
+            target_vx = args.flight_speed
         elif keyboard_module.is_pressed("s"):
-            vx = -args.flight_speed
+            target_vx = -args.flight_speed
 
         if keyboard_module.is_pressed("a"):
-            vy = -args.flight_speed
+            target_vy = -args.flight_speed
         elif keyboard_module.is_pressed("d"):
-            vy = args.flight_speed
+            target_vy = args.flight_speed
 
         if keyboard_module.is_pressed("up"):
-            vz = -args.flight_speed
+            target_vz = -args.flight_speed
         elif keyboard_module.is_pressed("down"):
-            vz = args.flight_speed
+            target_vz = args.flight_speed
 
         if keyboard_module.is_pressed("left"):
-            yaw_rate = -args.yaw_speed
+            target_yaw_rate = -args.yaw_speed
         elif keyboard_module.is_pressed("right"):
-            yaw_rate = args.yaw_speed
+            target_yaw_rate = args.yaw_speed
+
+        if args.flight_acceleration <= 0.0:
+            current_vx, current_vy, current_vz = target_vx, target_vy, target_vz
+        else:
+            velocity_step = args.flight_acceleration * dt
+            current_vx = move_toward(current_vx, target_vx, velocity_step)
+            current_vy = move_toward(current_vy, target_vy, velocity_step)
+            current_vz = move_toward(current_vz, target_vz, velocity_step)
+
+        if args.yaw_acceleration <= 0.0:
+            current_yaw_rate = target_yaw_rate
+        else:
+            yaw_step = args.yaw_acceleration * dt
+            current_yaw_rate = move_toward(
+                current_yaw_rate,
+                target_yaw_rate,
+                yaw_step,
+            )
 
         n_is_pressed = keyboard_module.is_pressed("n")
         if n_is_pressed and not n_was_pressed:
@@ -711,15 +776,18 @@ async def run_keyboard_control(drone, world, args):
                 )
             keep_running = False
 
-        if vx != 0.0 or vy != 0.0 or vz != 0.0:
+        if current_vx != 0.0 or current_vy != 0.0 or current_vz != 0.0:
             await drone.move_by_velocity_body_frame_async(
-                vx,
-                vy,
-                vz,
+                current_vx,
+                current_vy,
+                current_vz,
                 args.command_duration_sec,
             )
-        if yaw_rate != 0.0:
-            await drone.rotate_by_yaw_rate_async(yaw_rate, args.command_duration_sec)
+        if current_yaw_rate != 0.0:
+            await drone.rotate_by_yaw_rate_async(
+                current_yaw_rate,
+                args.command_duration_sec,
+            )
 
         await asyncio.sleep(0.01)
 
