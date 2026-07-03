@@ -27,17 +27,18 @@ import argparse
 import asyncio
 import math
 from pathlib import Path
+import queue
 import re
 import shutil
 import tempfile
+from threading import Lock, Thread
 import time
 
 import commentjson
 import projectairsim
 from projectairsim import Drone, World
-from projectairsim.image_utils import ImageDisplay
-from projectairsim.types import Pose, Quaternion, Vector3
-from projectairsim.utils import projectairsim_log, rpy_to_quaternion
+from projectairsim.types import BoxAlignment, Pose, Quaternion, Vector3
+from projectairsim.utils import projectairsim_log, rpy_to_quaternion, unpack_image
 
 keyboard = None
 
@@ -132,6 +133,125 @@ def move_toward(current, target, max_delta):
     if current > target:
         return max(current - max_delta, target)
     return current
+
+
+def quaternion_to_matrix(w, x, y, z):
+    magnitude = math.sqrt(w * w + x * x + y * y + z * z)
+    if magnitude <= 0.0:
+        return [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+
+    w /= magnitude
+    x /= magnitude
+    y /= magnitude
+    z /= magnitude
+
+    return [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+        [
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ]
+
+
+def camera_pose_from_image(image):
+    pose_keys = ("pos_x", "pos_y", "pos_z", "rot_w", "rot_x", "rot_y", "rot_z")
+    if not all(key in image for key in pose_keys):
+        return None
+
+    position = [float(image["pos_x"]), float(image["pos_y"]), float(image["pos_z"])]
+    rotation_matrix = quaternion_to_matrix(
+        float(image["rot_w"]),
+        float(image["rot_x"]),
+        float(image["rot_y"]),
+        float(image["rot_z"]),
+    )
+    return position, rotation_matrix
+
+
+def world_to_camera(point_ned, camera_position, camera_rotation_matrix):
+    delta = [
+        point_ned[0] - camera_position[0],
+        point_ned[1] - camera_position[1],
+        point_ned[2] - camera_position[2],
+    ]
+    return [
+        camera_rotation_matrix[0][axis] * delta[0]
+        + camera_rotation_matrix[1][axis] * delta[1]
+        + camera_rotation_matrix[2][axis] * delta[2]
+        for axis in range(3)
+    ]
+
+
+def project_ned_point(point_ned, image, fov_degrees):
+    camera_pose = camera_pose_from_image(image)
+    if camera_pose is None:
+        return None
+
+    width = int(image["width"])
+    height = int(image["height"])
+    camera_position, camera_rotation_matrix = camera_pose
+    point_camera = world_to_camera(point_ned, camera_position, camera_rotation_matrix)
+    forward_m = point_camera[0]
+    if forward_m <= 0.05:
+        return None
+
+    focal_px = width / (2.0 * math.tan(math.radians(fov_degrees) / 2.0))
+    pixel_x = width * 0.5 + focal_px * (point_camera[1] / forward_m)
+    pixel_y = height * 0.5 + focal_px * (point_camera[2] / forward_m)
+    return pixel_x, pixel_y, point_camera
+
+
+def dict_vector_to_list(vector):
+    return [float(vector["x"]), float(vector["y"]), float(vector["z"])]
+
+
+def pose_translation_ned(pose):
+    return dict_vector_to_list(pose["translation"])
+
+
+def bbox_corners_from_center_size(center, size):
+    half = [component * 0.5 for component in size]
+    corners = []
+    for sx in (-1.0, 1.0):
+        for sy in (-1.0, 1.0):
+            for sz in (-1.0, 1.0):
+                corners.append(
+                    [
+                        center[0] + sx * half[0],
+                        center[1] + sy * half[1],
+                        center[2] + sz * half[2],
+                    ]
+                )
+    return corners
+
+
+def fallback_pedestrian_bbox_corners(position_ned, args):
+    center = [
+        position_ned[0],
+        position_ned[1],
+        position_ned[2] - args.pedestrian_box_height_m * 0.5,
+    ]
+    size = [
+        args.pedestrian_box_depth_m,
+        args.pedestrian_box_width_m,
+        args.pedestrian_box_height_m,
+    ]
+    return bbox_corners_from_center_size(center, size)
 
 
 def resolve_config_path(config_name, sim_config_path):
@@ -311,6 +431,61 @@ def read_camera_origin(scene_name, sim_config_path, drone_name, camera_sensor_id
         return [0.5, 0.0, 0.0]
 
 
+def read_camera_fov_degrees(
+    scene_name,
+    sim_config_path,
+    drone_name,
+    camera_sensor_id,
+    default_fov_degrees,
+):
+    try:
+        scene_config = load_jsonc(resolve_config_path(scene_name, sim_config_path))
+        actor = next(
+            (
+                item
+                for item in scene_config.get("actors", [])
+                if item.get("type") == "robot" and item.get("name") == drone_name
+            ),
+            None,
+        )
+        if actor is None or not actor.get("robot-config"):
+            return default_fov_degrees
+
+        robot_config = load_jsonc(
+            resolve_config_path(actor["robot-config"], sim_config_path)
+        )
+        sensor = next(
+            (
+                item
+                for item in robot_config.get("sensors", [])
+                if item.get("id") == camera_sensor_id
+            ),
+            None,
+        )
+        if sensor is None:
+            return default_fov_degrees
+
+        scene_capture = next(
+            (
+                capture
+                for capture in sensor.get("capture-settings", [])
+                if capture.get("image-type") == 0
+            ),
+            None,
+        )
+        if scene_capture is None:
+            return default_fov_degrees
+        return float(scene_capture.get("fov-degrees", default_fov_degrees))
+    except Exception as exc:
+        projectairsim_log().warning(
+            "Could not read %s FOV; using %.1f deg: %s",
+            camera_sensor_id,
+            default_fov_degrees,
+            exc,
+        )
+        return default_fov_degrees
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description=(
@@ -411,6 +586,25 @@ def build_parser():
     parser.add_argument("--camera-display-width", type=int, default=960)
     parser.add_argument("--camera-display-height", type=int, default=540)
     parser.add_argument("--no-camera", action="store_true")
+    parser.add_argument(
+        "--no-pedestrian-box",
+        action="store_true",
+        help="Disable the red pedestrian box overlay in the front RGB window.",
+    )
+    parser.add_argument(
+        "--pedestrian-position-interval-sec",
+        type=float,
+        default=0.2,
+        help="How often to read/print pedestrian NED position.",
+    )
+    parser.add_argument(
+        "--no-pedestrian-position",
+        action="store_true",
+        help="Disable periodic pedestrian NED position printing.",
+    )
+    parser.add_argument("--pedestrian-box-width-m", type=float, default=0.8)
+    parser.add_argument("--pedestrian-box-depth-m", type=float, default=0.8)
+    parser.add_argument("--pedestrian-box-height-m", type=float, default=1.8)
     return parser
 
 
@@ -555,6 +749,280 @@ def set_pedestrian_speed(world, pedestrian_name_or_tag, speed):
     return False
 
 
+def get_pedestrian_position_ned(world, pedestrian_actor):
+    return pose_translation_ned(world.get_object_pose(pedestrian_actor))
+
+
+def update_pedestrian_tracking(world, args, display, last_error):
+    try:
+        position = None
+        pose_error = None
+        try:
+            position = get_pedestrian_position_ned(world, args.pedestrian)
+        except Exception as exc:
+            pose_error = exc
+
+        bbox_corners = None
+        if display is not None and not args.no_pedestrian_box:
+            try:
+                bbox = world.get_3d_bounding_box(
+                    args.pedestrian,
+                    BoxAlignment.WORLD_AXIS,
+                )
+                if bbox and bbox.get("center") and bbox.get("size"):
+                    center = dict_vector_to_list(bbox["center"])
+                    size = dict_vector_to_list(bbox["size"])
+                    if all(component > 0.01 for component in size):
+                        bbox_corners = bbox_corners_from_center_size(center, size)
+                        if position is None:
+                            position = center
+            except Exception:
+                pass
+
+            if bbox_corners is None and position is not None:
+                bbox_corners = fallback_pedestrian_bbox_corners(position, args)
+            if position is not None:
+                display.set_pedestrian_state(args.pedestrian, position, bbox_corners)
+
+        if position is None and pose_error is not None:
+            raise pose_error
+        if position is None:
+            raise RuntimeError("pedestrian position unavailable")
+        return position, None
+    except Exception as exc:
+        error = str(exc)
+        if error != last_error:
+            print(f"Could not read pedestrian position for {args.pedestrian}: {exc}")
+        return None, error
+
+
+class PedestrianOverlayDisplay:
+    def __init__(
+        self,
+        window_name,
+        fov_degrees,
+        resize_x,
+        resize_y,
+        draw_box=True,
+    ):
+        self.window_name = window_name
+        self.fov_degrees = fov_degrees
+        self.resize_x = resize_x
+        self.resize_y = resize_y
+        self.draw_box = draw_box
+        self.running = False
+        self.thread = None
+        self.image_queue = queue.SimpleQueue()
+        self.buffer_size = 3
+        self.lock = Lock()
+        self.pedestrian_actor = None
+        self.pedestrian_position_ned = None
+        self.pedestrian_bbox_corners_ned = None
+        self.error = None
+
+    def start(self):
+        if self.thread:
+            return
+        self.running = True
+        self.thread = Thread(target=self.display_loop)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join()
+        self.thread = None
+
+    def receive(self, image):
+        if not self.running or image is None:
+            return
+        while not self.image_queue.empty() and self.image_queue.qsize() > self.buffer_size:
+            self.image_queue.get()
+        self.image_queue.put(image)
+
+    def set_pedestrian_state(self, actor_name, position_ned, bbox_corners_ned):
+        with self.lock:
+            self.pedestrian_actor = actor_name
+            self.pedestrian_position_ned = position_ned
+            self.pedestrian_bbox_corners_ned = bbox_corners_ned
+
+    def display_loop(self):
+        import cv2
+
+        created = False
+        try:
+            while self.running:
+                if self.image_queue.empty():
+                    if cv2.waitKey(1) == 27:
+                        self.running = False
+                    continue
+
+                image = self.image_queue.get()
+                while not self.image_queue.empty():
+                    image = self.image_queue.get()
+
+                frame = unpack_image(image)
+                if frame is None:
+                    continue
+                frame = frame.copy()
+                if frame.ndim == 2:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                elif frame.ndim == 3 and frame.shape[2] == 1:
+                    frame = cv2.cvtColor(frame[:, :, 0], cv2.COLOR_GRAY2BGR)
+
+                if self.draw_box:
+                    self.draw_pedestrian_overlay(cv2, frame, image)
+
+                if self.resize_x is not None and self.resize_y is not None:
+                    frame = cv2.resize(frame, (self.resize_x, self.resize_y))
+
+                if not created:
+                    cv2.namedWindow(
+                        self.window_name,
+                        flags=cv2.WINDOW_GUI_NORMAL + cv2.WINDOW_AUTOSIZE,
+                    )
+                    created = True
+
+                cv2.imshow(self.window_name, frame)
+                if cv2.waitKey(1) == 27:
+                    self.running = False
+        except Exception as exc:
+            self.error = exc
+            self.running = False
+        finally:
+            if created:
+                cv2.destroyWindow(self.window_name)
+
+    def draw_pedestrian_overlay(self, cv2, frame, image):
+        height, width = frame.shape[:2]
+        box = self.annotation_box(image)
+        with self.lock:
+            actor_name = self.pedestrian_actor
+            position_ned = (
+                list(self.pedestrian_position_ned)
+                if self.pedestrian_position_ned is not None
+                else None
+            )
+            corners = (
+                list(self.pedestrian_bbox_corners_ned)
+                if self.pedestrian_bbox_corners_ned is not None
+                else None
+            )
+
+        if box is None and corners:
+            box = self.project_bbox_to_image(corners, image, width, height)
+
+        if box is None and position_ned:
+            projection = project_ned_point(position_ned, image, self.fov_degrees)
+            if projection is not None:
+                x, y, _ = projection
+                marker_size = 24
+                box = (
+                    x - marker_size,
+                    y - marker_size,
+                    x + marker_size,
+                    y + marker_size,
+                )
+
+        if box is None:
+            return
+
+        clipped_box = self.clip_box(box, width, height)
+        if clipped_box is None:
+            return
+
+        x1, y1, x2, y2 = clipped_box
+        red = (0, 0, 255)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), red, 2, cv2.LINE_AA)
+        label = "Pedestrian"
+        if actor_name:
+            label = actor_name
+        if position_ned:
+            label += (
+                f" NED {position_ned[0]:.1f}, "
+                f"{position_ned[1]:.1f}, {position_ned[2]:.1f}"
+            )
+        self.draw_text_with_shadow(cv2, frame, label, (x1 + 4, max(18, y1 - 8)))
+
+    def annotation_box(self, image):
+        annotations = image.get("annotations") or []
+        with self.lock:
+            actor_name = self.pedestrian_actor
+        for annotation in annotations:
+            object_id = str(annotation.get("object_id", ""))
+            if actor_name and actor_name not in object_id and object_id not in actor_name:
+                continue
+            bbox = annotation.get("bbox2d")
+            if not bbox:
+                continue
+            center = bbox.get("center", {})
+            size = bbox.get("size", {})
+            if not center or not size:
+                continue
+            width = float(size["x"])
+            height = float(size["y"])
+            if width <= 1.0 or height <= 1.0:
+                continue
+            x = float(center["x"])
+            y = float(center["y"])
+            return x - width * 0.5, y - height * 0.5, x + width * 0.5, y + height * 0.5
+        return None
+
+    def project_bbox_to_image(self, corners_ned, image, width, height):
+        projected = []
+        for corner in corners_ned:
+            projection = project_ned_point(corner, image, self.fov_degrees)
+            if projection is None:
+                continue
+            projected.append((projection[0], projection[1]))
+
+        if not projected:
+            return None
+
+        xs = [point[0] for point in projected]
+        ys = [point[1] for point in projected]
+        margin = 4.0
+        box = min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin
+        return self.clip_box(box, width, height, return_none_if_outside=True)
+
+    def clip_box(self, box, width, height, return_none_if_outside=True):
+        x1, y1, x2, y2 = box
+        if x2 < 0 or y2 < 0 or x1 >= width or y1 >= height:
+            return None if return_none_if_outside else (0, 0, 0, 0)
+        x1 = max(0, min(width - 1, int(round(x1))))
+        y1 = max(0, min(height - 1, int(round(y1))))
+        x2 = max(0, min(width - 1, int(round(x2))))
+        y2 = max(0, min(height - 1, int(round(y2))))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return x1, y1, x2, y2
+
+    def draw_text_with_shadow(self, cv2, frame, text, origin):
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.5
+        thickness = 1
+        cv2.putText(
+            frame,
+            text,
+            origin,
+            font,
+            scale,
+            (0, 0, 0),
+            thickness + 2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            text,
+            origin,
+            font,
+            scale,
+            (0, 0, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
 async def takeoff(drone):
     print("Arming the drone...")
     drone.arm()
@@ -618,23 +1086,33 @@ def start_front_rgb_display(client, drone, args, scene_name, sim_config_path):
         print(f"Warning: failed to set {args.camera} camera pose.")
 
     camera_topic = require_scene_camera_topic(drone, args.camera)
-    image_display = ImageDisplay(num_subwin=1)
+    fov_degrees = read_camera_fov_degrees(
+        scene_name,
+        sim_config_path,
+        args.drone_name,
+        args.camera,
+        args.camera_fov_degrees,
+    )
     window_name = f"Front RGB ({args.camera})"
-    image_display.add_image(
+    image_display = PedestrianOverlayDisplay(
         window_name,
+        fov_degrees,
         resize_x=args.camera_display_width,
         resize_y=args.camera_display_height,
+        draw_box=not args.no_pedestrian_box,
     )
     image_display.start()
     client.subscribe(
         camera_topic,
-        lambda _, image: image_display.receive(image, window_name),
+        lambda _, image: image_display.receive(image),
     )
     print(f"Subscribed front RGB camera topic: {camera_topic}")
+    if not args.no_pedestrian_box:
+        print(f"Drawing red pedestrian box using {fov_degrees:g} degree camera FOV.")
     return image_display, camera_topic
 
 
-async def run_keyboard_control(drone, world, args):
+async def run_keyboard_control(drone, world, args, pedestrian_display=None):
     keyboard_module = require_keyboard()
 
     drone.enable_api_control()
@@ -674,6 +1152,8 @@ async def run_keyboard_control(drone, world, args):
     current_vz = 0.0
     current_yaw_rate = 0.0
     last_control_at = time.monotonic()
+    last_pedestrian_update_at = 0.0
+    last_pedestrian_error = None
 
     while keep_running:
         now = time.monotonic()
@@ -686,6 +1166,22 @@ async def run_keyboard_control(drone, world, args):
                 last_live_ned_at,
                 args.live_ned_interval_sec,
             )
+
+        if now - last_pedestrian_update_at >= args.pedestrian_position_interval_sec:
+            last_pedestrian_update_at = now
+            pedestrian_position, last_pedestrian_error = update_pedestrian_tracking(
+                world,
+                args,
+                pedestrian_display,
+                last_pedestrian_error,
+            )
+            if pedestrian_position is not None and not args.no_pedestrian_position:
+                print(
+                    f"[PEDESTRIAN NED] x={pedestrian_position[0]:8.2f}  "
+                    f"y={pedestrian_position[1]:8.2f}  "
+                    f"z={pedestrian_position[2]:8.2f}",
+                    flush=True,
+                )
 
         target_vx, target_vy, target_vz, target_yaw_rate = 0.0, 0.0, 0.0, 0.0
 
@@ -859,7 +1355,7 @@ async def main():
                 sim_config_path,
             )
 
-        await run_keyboard_control(drone, world, args)
+        await run_keyboard_control(drone, world, args, image_display)
         return 0
 
     except Exception as exc:
