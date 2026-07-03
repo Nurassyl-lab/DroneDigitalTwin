@@ -1,24 +1,24 @@
 """
-Keyboard drone + BP_Truck controller for the truck-to-pedestrian demo.
+Keyboard drone + BP_Truck + BP_ThirdPersonCharacter controller for the
+truck-to-pedestrian demo.
 
 Examples:
     python truck2ped.py --start 0 0 -2
-    python truck2ped.py --start "10,0,-3" --truck BP_Truck_1
+    python truck2ped.py --start "10,0,-3" --truck BP_Truck_1 --pedestrian BP_ThirdPersonCharacter_C_1
 
 Controls:
     W/S: drone forward/back
     A/D: drone left/right
     Up/Down: drone up/down
     Left/Right: drone yaw
-    N: stop truck by setting TargetSpeed to 0
-    M: move truck by setting TargetSpeed to 100
+    N: stop truck and start pedestrian crossing
+    M: stop pedestrian and resume truck
     L: land
     Q: quit
 
-The truck movement remains inside BP_Truck Tick. Python calls
-SetTruckSpeed(NewSpeed), which should update TargetSpeed. If that event is not
-available, Python falls back to setting TargetSpeed directly. It never writes
-CurrentSpeed and never teleports the truck.
+The truck movement remains inside BP_Truck Tick. The pedestrian movement should
+remain inside BP_ThirdPersonCharacter Tick using CharacterMovement/AddMovementInput.
+Python only sends SetTruckSpeed(NewSpeed) and SetPedestrianSpeed(NewSpeed).
 """
 
 import argparse
@@ -303,7 +303,9 @@ def read_camera_origin(scene_name, sim_config_path, drone_name, camera_sensor_id
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Fly Drone1 while controlling BP_Truck TargetSpeed."
+        description=(
+            "Fly Drone1 while controlling BP_Truck and BP_ThirdPersonCharacter."
+        )
     )
     parser.add_argument("--address", default="127.0.0.1")
     parser.add_argument("--topicsport", type=int, default=8989)
@@ -328,13 +330,29 @@ def build_parser():
         help="Truck actor name/substring or Unreal tag. Defaults to 'Truck'.",
     )
     parser.add_argument(
+        "--pedestrian",
+        default="BP_ThirdPersonCharacter",
+        help=(
+            "Pedestrian actor name/substring or Unreal tag. Defaults to "
+            "'BP_ThirdPersonCharacter'."
+        ),
+    )
+    parser.add_argument(
         "--speed",
         type=float,
         default=None,
         help="Optional initial truck TargetSpeed before keyboard control starts.",
     )
+    parser.add_argument(
+        "--pedestrian-speed",
+        type=float,
+        default=None,
+        help="Optional initial PedestrianSpeed before keyboard control starts.",
+    )
     parser.add_argument("--truck-stop-speed", type=float, default=0.0)
-    parser.add_argument("--truck-move-speed", type=float, default=100.0)
+    parser.add_argument("--truck-move-speed", type=float, default=700.0)
+    parser.add_argument("--pedestrian-stop-speed", type=float, default=0.0)
+    parser.add_argument("--pedestrian-walk-speed", type=float, default=0.3)
     parser.add_argument("--flight-speed", type=float, default=5.0)
     parser.add_argument("--yaw-speed", type=float, default=20.0)
     parser.add_argument("--command-duration-sec", type=float, default=0.1)
@@ -370,28 +388,47 @@ def find_matching_actors(world, pattern):
         return []
 
 
-def resolve_truck_actor(world, truck_name_or_tag):
-    escaped = re.escape(truck_name_or_tag)
+def resolve_unreal_actor(world, actor_name_or_tag, fallback_pattern, label):
+    escaped = re.escape(actor_name_or_tag)
     exact_or_contains = find_matching_actors(world, f".*{escaped}.*")
     if exact_or_contains:
-        if truck_name_or_tag in exact_or_contains:
-            return truck_name_or_tag
+        if actor_name_or_tag in exact_or_contains:
+            return actor_name_or_tag
         return exact_or_contains[0]
 
-    unreal_instance_match = re.match(r"^(.*)_(\d+)$", truck_name_or_tag)
-    if unreal_instance_match and not truck_name_or_tag.endswith("_C"):
+    unreal_instance_match = re.match(r"^(.*)_(\d+)$", actor_name_or_tag)
+    if unreal_instance_match and not actor_name_or_tag.endswith("_C"):
         candidate = f"{unreal_instance_match.group(1)}_C_{unreal_instance_match.group(2)}"
         candidate_matches = find_matching_actors(world, f".*{re.escape(candidate)}.*")
         if candidate_matches:
             return candidate_matches[0]
 
-    bp_matches = find_matching_actors(world, r".*BP_Truck.*")
+    bp_matches = find_matching_actors(world, fallback_pattern)
     if bp_matches:
-        print("Available BP_Truck-like actor names:")
+        print(f"Available {label}-like actor names:")
         for name in bp_matches:
             print(f"  {name}")
+        return bp_matches[0]
 
-    return truck_name_or_tag
+    return actor_name_or_tag
+
+
+def resolve_truck_actor(world, truck_name_or_tag):
+    return resolve_unreal_actor(
+        world,
+        truck_name_or_tag,
+        r".*BP_Truck.*",
+        "BP_Truck",
+    )
+
+
+def resolve_pedestrian_actor(world, pedestrian_name_or_tag):
+    return resolve_unreal_actor(
+        world,
+        pedestrian_name_or_tag,
+        r".*(BP_ThirdPersonCharacter|Pedestrian|ThirdPerson).*",
+        "BP_ThirdPersonCharacter",
+    )
 
 
 def set_truck_speed(world, truck_name_or_tag, speed):
@@ -432,6 +469,55 @@ def set_truck_speed(world, truck_name_or_tag, speed):
     print(
         "Could not find the truck/event/property. Check the actor name/tag, "
         "SetTruckSpeed(NewSpeed), and TargetSpeed variable."
+    )
+    return False
+
+
+def set_pedestrian_speed(world, pedestrian_name_or_tag, speed):
+    pedestrian_actor = resolve_pedestrian_actor(world, pedestrian_name_or_tag)
+    if pedestrian_actor != pedestrian_name_or_tag:
+        print(
+            f"Resolved pedestrian '{pedestrian_name_or_tag}' "
+            f"to actor '{pedestrian_actor}'."
+        )
+
+    print(f"Setting {pedestrian_actor} pedestrian speed to {speed:g}...")
+
+    try:
+        called = world.call_actor_event(
+            pedestrian_actor,
+            "SetPedestrianSpeed",
+            {"NewSpeed": speed},
+        )
+    except RuntimeError as exc:
+        if "CallActorFloatEvent" in str(exc) and "not supported" in str(exc):
+            print(
+                "The running Unreal plugin does not expose CallActorFloatEvent. "
+                "Recompile/rebuild the WalkingNPCs ProjectAirSim plugin, restart "
+                "the editor, press Play, then run this script again."
+            )
+        return False
+
+    if called:
+        print("Called BP_ThirdPersonCharacter.SetPedestrianSpeed(NewSpeed).")
+        return True
+
+    print(
+        "SetPedestrianSpeed was not found; trying direct "
+        "PedestrianSpeed variable set..."
+    )
+    set_property = world.set_actor_float_property(
+        pedestrian_actor,
+        "PedestrianSpeed",
+        speed,
+    )
+    if set_property:
+        print("Set BP_ThirdPersonCharacter PedestrianSpeed variable directly.")
+        return True
+
+    print(
+        "Could not find the pedestrian/event/property. Check the actor name/tag, "
+        "SetPedestrianSpeed(NewSpeed), and PedestrianSpeed variable."
     )
     return False
 
@@ -526,8 +612,14 @@ async def run_keyboard_control(drone, world, args):
     print("A/D: drone left/right")
     print("Up/Down: drone up/down")
     print("Left/Right: drone yaw")
-    print(f"N: truck stop TargetSpeed={args.truck_stop_speed:g}")
-    print(f"M: truck move TargetSpeed={args.truck_move_speed:g}")
+    print(
+        f"N: truck TargetSpeed={args.truck_stop_speed:g}, "
+        f"pedestrian speed={args.pedestrian_walk_speed:g}"
+    )
+    print(
+        f"M: pedestrian speed={args.pedestrian_stop_speed:g}, "
+        f"truck TargetSpeed={args.truck_move_speed:g}"
+    )
     print("L: land")
     print("Q: quit")
     if not args.no_live_ned:
@@ -572,10 +664,20 @@ async def run_keyboard_control(drone, world, args):
         n_is_pressed = keyboard_module.is_pressed("n")
         if n_is_pressed and not n_was_pressed:
             set_truck_speed(world, args.truck, args.truck_stop_speed)
+            set_pedestrian_speed(
+                world,
+                args.pedestrian,
+                args.pedestrian_walk_speed,
+            )
         n_was_pressed = n_is_pressed
 
         m_is_pressed = keyboard_module.is_pressed("m")
         if m_is_pressed and not m_was_pressed:
+            set_pedestrian_speed(
+                world,
+                args.pedestrian,
+                args.pedestrian_stop_speed,
+            )
             set_truck_speed(world, args.truck, args.truck_move_speed)
         m_was_pressed = m_is_pressed
 
@@ -640,6 +742,20 @@ async def main():
         )
         drone = Drone(client, world, args.drone_name)
 
+        resolved_truck = resolve_truck_actor(world, args.truck)
+        if resolved_truck != args.truck:
+            print(f"Resolved truck '{args.truck}' to actor '{resolved_truck}'.")
+            args.truck = resolved_truck
+        resolved_pedestrian = resolve_pedestrian_actor(world, args.pedestrian)
+        if resolved_pedestrian != args.pedestrian:
+            print(
+                f"Resolved pedestrian '{args.pedestrian}' "
+                f"to actor '{resolved_pedestrian}'."
+            )
+            args.pedestrian = resolved_pedestrian
+        print(f"Controlling truck actor: {args.truck}")
+        print(f"Controlling pedestrian actor: {args.pedestrian}")
+
         if args.start is not None:
             print(f"Spawning {args.drone_name} at NED {args.start}...")
             drone.set_pose(make_pose_ned(args.start), reset_kinematics=True)
@@ -654,6 +770,8 @@ async def main():
 
         if args.speed is not None:
             set_truck_speed(world, args.truck, args.speed)
+        if args.pedestrian_speed is not None:
+            set_pedestrian_speed(world, args.pedestrian, args.pedestrian_speed)
 
         if not args.no_camera:
             image_display, camera_topic = start_front_rgb_display(
