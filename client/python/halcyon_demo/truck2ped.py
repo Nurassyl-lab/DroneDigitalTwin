@@ -1,5 +1,5 @@
 """
-Control BP_Truck speed through ProjectAirSim without teleporting the truck.
+Control BP_Truck target speed through ProjectAirSim without teleporting the truck.
 
 Examples:
     python truck2ped.py --truck BP_Truck_C_1 --speed 0
@@ -9,6 +9,8 @@ Examples:
 
 The Unreal actor can be addressed by exact/partial actor name or by an Actor
 tag such as "Truck". The Blueprint should expose SetTruckSpeed(NewSpeed).
+SetTruckSpeed should update TargetSpeed; BP_Truck Tick should interpolate
+CurrentSpeed toward TargetSpeed and move the actor.
 """
 
 import argparse
@@ -20,7 +22,7 @@ import projectairsim
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Set BP_Truck Speed from ProjectAirSim Python."
+        description="Set BP_Truck TargetSpeed from ProjectAirSim Python."
     )
     parser.add_argument(
         "--address",
@@ -71,7 +73,7 @@ def build_parser():
         "--speed",
         type=float,
         default=700.0,
-        help="Truck speed to set. Use 0 to stop, 700 to move.",
+        help="Truck target speed to set. Use 0 to brake/stop, 700 to move.",
     )
     parser.add_argument(
         "--stop",
@@ -128,7 +130,7 @@ def set_truck_speed(world, truck_name_or_tag, speed):
     if truck_actor != truck_name_or_tag:
         print(f"Resolved truck '{truck_name_or_tag}' to actor '{truck_actor}'.")
 
-    print(f"Setting {truck_actor} speed to {speed:g}...")
+    print(f"Setting {truck_actor} target speed to {speed:g}...")
 
     try:
         called = world.call_actor_event(
@@ -146,18 +148,18 @@ def set_truck_speed(world, truck_name_or_tag, speed):
         return False
 
     if called:
-        print("Called BP_Truck.SetTruckSpeed(NewSpeed).")
+        print("Called BP_Truck.SetTruckSpeed(NewSpeed); Blueprint will interpolate CurrentSpeed.")
         return True
 
-    print("SetTruckSpeed was not found; trying direct Speed variable set...")
-    set_property = world.set_actor_float_property(truck_actor, "Speed", speed)
+    print("SetTruckSpeed was not found; trying direct TargetSpeed variable set...")
+    set_property = world.set_actor_float_property(truck_actor, "TargetSpeed", speed)
     if set_property:
-        print("Set BP_Truck Speed variable directly.")
+        print("Set BP_Truck TargetSpeed variable directly.")
         return True
 
     print(
         "Could not find the truck/event/property. Check the actor name/tag, "
-        "SetTruckSpeed(NewSpeed), and Speed variable."
+        "SetTruckSpeed(NewSpeed), and TargetSpeed variable."
     )
     return False
 
