@@ -12,8 +12,8 @@ Controls:
     Up/Down: drone up/down
     Left/Right: drone yaw
     N: stop truck
-    M: set truck speed to 100
-    Z: set pedestrian speed to 10
+    M: set truck speed to 600
+    Z: set pedestrian speed to 3
     X: stop pedestrian
     L: land
     Q: quit
@@ -352,10 +352,10 @@ def build_parser():
         help="Optional initial PedestrianSpeed before keyboard control starts.",
     )
     parser.add_argument("--truck-stop-speed", type=float, default=0.0)
-    parser.add_argument("--truck-move-speed", type=float, default=100.0)
+    parser.add_argument("--truck-move-speed", type=float, default=600.0)
     parser.add_argument("--pedestrian-stop-speed", type=float, default=0.0)
     parser.add_argument("--pedestrian-walk-speed", type=float, default=0.3)
-    parser.add_argument("--pedestrian-z-speed", type=float, default=10.0)
+    parser.add_argument("--pedestrian-z-speed", type=float, default=3.0)
     parser.add_argument("--flight-speed", type=float, default=5.0)
     parser.add_argument("--yaw-speed", type=float, default=20.0)
     parser.add_argument("--command-duration-sec", type=float, default=0.1)
