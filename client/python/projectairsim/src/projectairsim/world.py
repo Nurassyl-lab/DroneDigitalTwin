@@ -557,6 +557,22 @@ class World(object):
             return True
         return self.set_actor_float_property(actor_name_or_tag, "TargetSpeed", speed)
 
+    def set_pedestrian_speed(self, actor_name_or_tag: str, speed: float) -> bool:
+        """Set a BP_ThirdPersonCharacter speed through SetPedestrianSpeed.
+
+        The pedestrian Blueprint should own walking by storing PedestrianSpeed
+        and using CharacterMovement/AddMovementInput in Tick. The fallback
+        updates PedestrianSpeed directly and never teleports the character.
+        """
+        called = self.call_actor_event(
+            actor_name_or_tag, "SetPedestrianSpeed", {"NewSpeed": speed}
+        )
+        if called:
+            return True
+        return self.set_actor_float_property(
+            actor_name_or_tag, "PedestrianSpeed", speed
+        )
+
     def spawn_object(
         self,
         object_name: str,
