@@ -5,6 +5,7 @@ truck-to-pedestrian demo.
 Examples:
     python truck2ped.py --start 0 0 -2
     python truck2ped.py --start "10,0,-3" --truck BP_Truck_1 --pedestrian BP_ThirdPersonCharacter_C_1
+    python truck2ped.py --start 0 0 -2 --video-path .\video
 
 Controls:
     W/S: drone forward/back
@@ -17,6 +18,9 @@ Controls:
     X: stop pedestrian
     L: land
     Q: quit
+
+The front RGB window records to MP4 by default and includes a third-person
+drone view in the upper-right corner. Use --video-path "" to disable recording.
 
 The truck movement remains inside BP_Truck Tick. The pedestrian movement should
 remain inside BP_ThirdPersonCharacter Tick using CharacterMovement/AddMovementInput.
@@ -100,6 +104,25 @@ def make_camera_pose(translation_xyz, angle_down_deg):
                     "x": translation_xyz[0],
                     "y": translation_xyz[1],
                     "z": translation_xyz[2],
+                }
+            ),
+            "rotation": Quaternion({"w": w, "x": x, "y": y, "z": z}),
+            "frame_id": "DEFAULT_ID",
+        }
+    )
+
+
+def make_third_person_camera_pose(distance_m, height_m, pitch_deg):
+    distance_m = max(0.1, float(distance_m))
+    height_m = max(0.0, float(height_m))
+    w, x, y, z = rpy_to_quaternion(0.0, math.radians(-pitch_deg), 0.0)
+    return Pose(
+        {
+            "translation": Vector3(
+                {
+                    "x": -distance_m,
+                    "y": 0.0,
+                    "z": -height_m,
                 }
             ),
             "rotation": Quaternion({"w": w, "x": x, "y": y, "z": z}),
@@ -270,6 +293,27 @@ def write_jsonc(path, data):
     Path(path).write_text(commentjson.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def prepare_video_output_path(video_path):
+    if video_path is None or str(video_path) == "":
+        print("FPV video recording disabled.")
+        return None
+
+    requested_path = Path(video_path).expanduser()
+    if requested_path.suffix.lower() == ".mp4":
+        output_dir = requested_path.parent
+        output_path = requested_path
+    else:
+        output_dir = requested_path
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_path = output_dir / f"truck2ped_fpv_{timestamp}.mp4"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not output_dir.is_dir():
+        raise RuntimeError(f"FPV video path is not a directory: {output_dir}")
+
+    return output_path
+
+
 def default_front_camera_sensor(args):
     return {
         "id": "FrontCamera",
@@ -293,6 +337,41 @@ def default_front_camera_sensor(args):
         "origin": {
             "xyz": "0.5 0.0 0.0",
             "rpy-deg": "0 0 0",
+        },
+    }
+
+
+def default_third_person_camera_sensor(args):
+    return {
+        "id": args.third_person_camera,
+        "type": "camera",
+        "enabled": True,
+        "parent-link": "Frame",
+        "capture-interval": args.camera_capture_interval_sec,
+        "capture-settings": [
+            {
+                "image-type": 0,
+                "width": args.camera_capture_width,
+                "height": args.camera_capture_height,
+                "fov-degrees": args.camera_fov_degrees,
+                "capture-enabled": True,
+                "streaming-enabled": True,
+                "pixels-as-float": False,
+                "compress": False,
+                "target-gamma": 2.5,
+            }
+        ],
+        "gimbal": {
+            "lock-roll": True,
+            "lock-pitch": True,
+            "lock-yaw": False,
+        },
+        "origin": {
+            "xyz": (
+                f"-{max(0.1, args.third_person_camera_distance_m):g} "
+                f"0.0 -{max(0.0, args.third_person_camera_height_m):g}"
+            ),
+            "rpy-deg": f"0 {-args.third_person_camera_pitch_deg:g} 0",
         },
     }
 
@@ -327,6 +406,14 @@ def ensure_requested_camera(robot_config, camera_sensor_id, args):
     if sensor is None and camera_sensor_id == "FrontCamera":
         sensors.append(default_front_camera_sensor(args))
         print("Added runtime FrontCamera RGB sensor to the drone config.")
+        return
+
+    if sensor is None and camera_sensor_id == args.third_person_camera:
+        sensors.append(default_third_person_camera_sensor(args))
+        print(
+            f"Added runtime {args.third_person_camera} third-person RGB sensor "
+            "to the drone config."
+        )
         return
 
     if sensor is not None and sensor.get("type") == "camera":
@@ -369,6 +456,12 @@ def make_runtime_scene_config(args):
 
             if actor is target_actor:
                 ensure_requested_camera(robot_config, args.camera, args)
+                if not args.no_third_person_overlay:
+                    ensure_requested_camera(
+                        robot_config,
+                        args.third_person_camera,
+                        args,
+                    )
 
             output_name = f"{robot_config_path.stem}_{actor_index}_truck2ped.jsonc"
             write_jsonc(temp_config_dir / output_name, robot_config)
@@ -585,6 +678,60 @@ def build_parser():
     parser.add_argument("--camera-fov-degrees", type=float, default=90.0)
     parser.add_argument("--camera-display-width", type=int, default=960)
     parser.add_argument("--camera-display-height", type=int, default=540)
+    parser.add_argument(
+        "--max-fps",
+        type=float,
+        default=60.0,
+        help="Maximum front RGB preview and MP4 recording frame rate.",
+    )
+    parser.add_argument(
+        "--video-path",
+        default=str(SCRIPT_DIR / "video"),
+        help=(
+            "Directory for timestamped FPV MP4 recordings, or an explicit .mp4 "
+            "file path. Use an empty string to disable recording."
+        ),
+    )
+    parser.add_argument(
+        "--third-person-camera",
+        default="Chase",
+        help="Camera used for the upper-right third-person drone inset.",
+    )
+    parser.add_argument(
+        "--third-person-camera-distance-m",
+        type=float,
+        default=10.0,
+        help="How far behind the drone the third-person camera is placed.",
+    )
+    parser.add_argument(
+        "--third-person-camera-height-m",
+        type=float,
+        default=1.5,
+        help="How far above the drone the third-person camera is placed.",
+    )
+    parser.add_argument(
+        "--third-person-camera-pitch-deg",
+        type=float,
+        default=12.0,
+        help="Downward pitch angle for the third-person camera.",
+    )
+    parser.add_argument(
+        "--third-person-overlay-width-frac",
+        type=float,
+        default=0.28,
+        help="Inset width as a fraction of the front RGB frame width.",
+    )
+    parser.add_argument(
+        "--third-person-overlay-margin-px",
+        type=int,
+        default=16,
+        help="Pixel margin from the top/right edge for the third-person inset.",
+    )
+    parser.add_argument(
+        "--no-third-person-overlay",
+        action="store_true",
+        help="Disable the upper-right third-person picture-in-picture inset.",
+    )
     parser.add_argument("--no-camera", action="store_true")
     parser.add_argument(
         "--no-pedestrian-box",
@@ -803,12 +950,29 @@ class PedestrianOverlayDisplay:
         fov_degrees,
         resize_x,
         resize_y,
+        max_fps,
+        video_output_path,
+        third_person_overlay,
+        third_person_overlay_width_frac,
+        third_person_overlay_margin_px,
+        third_person_label,
         draw_box=True,
     ):
         self.window_name = window_name
         self.fov_degrees = fov_degrees
         self.resize_x = resize_x
         self.resize_y = resize_y
+        self.max_fps = max(1.0, float(max_fps))
+        self.video_output_path = video_output_path
+        self.video_writer = None
+        self.third_person_overlay = third_person_overlay
+        self.third_person_overlay_width_frac = max(
+            0.1,
+            min(0.6, float(third_person_overlay_width_frac)),
+        )
+        self.third_person_overlay_margin_px = max(0, int(third_person_overlay_margin_px))
+        self.third_person_label = third_person_label
+        self.third_person_image = None
         self.draw_box = draw_box
         self.running = False
         self.thread = None
@@ -819,12 +983,16 @@ class PedestrianOverlayDisplay:
         self.pedestrian_position_ned = None
         self.pedestrian_bbox_corners_ned = None
         self.error = None
+        self.frame_count = 0
+        self._last_frame_time = None
+        self._frame_intervals = []
+        self._pending_first_frame = None
 
     def start(self):
         if self.thread:
             return
         self.running = True
-        self.thread = Thread(target=self.display_loop)
+        self.thread = Thread(target=self.display_loop, daemon=True)
         self.thread.start()
 
     def stop(self):
@@ -840,6 +1008,11 @@ class PedestrianOverlayDisplay:
             self.image_queue.get()
         self.image_queue.put(image)
 
+    def receive_third_person(self, image):
+        if not self.running or image is None:
+            return
+        self.third_person_image = image
+
     def set_pedestrian_state(self, actor_name, position_ned, bbox_corners_ned):
         with self.lock:
             self.pedestrian_actor = actor_name
@@ -850,8 +1023,17 @@ class PedestrianOverlayDisplay:
         import cv2
 
         created = False
+        frame_interval_sec = 1.0 / self.max_fps
+        next_frame_at = time.monotonic()
         try:
             while self.running:
+                now = time.monotonic()
+                if now < next_frame_at:
+                    wait_ms = max(1, int((next_frame_at - now) * 1000.0))
+                    if cv2.waitKey(wait_ms) == 27:
+                        self.running = False
+                    continue
+
                 if self.image_queue.empty():
                     if cv2.waitKey(1) == 27:
                         self.running = False
@@ -865,16 +1047,30 @@ class PedestrianOverlayDisplay:
                 if frame is None:
                     continue
                 frame = frame.copy()
+
+                now = time.monotonic()
+                if self._last_frame_time is not None:
+                    interval = now - self._last_frame_time
+                    if interval > 0.0:
+                        self._frame_intervals.append(interval)
+                        if len(self._frame_intervals) > 30:
+                            self._frame_intervals.pop(0)
+                self._last_frame_time = now
+
                 if frame.ndim == 2:
                     frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
                 elif frame.ndim == 3 and frame.shape[2] == 1:
                     frame = cv2.cvtColor(frame[:, :, 0], cv2.COLOR_GRAY2BGR)
 
+                self.frame_count += 1
                 if self.draw_box:
                     self.draw_pedestrian_overlay(cv2, frame, image)
+                self.draw_third_person_overlay(cv2, frame)
 
                 if self.resize_x is not None and self.resize_y is not None:
                     frame = cv2.resize(frame, (self.resize_x, self.resize_y))
+
+                self.write_video_frame(cv2, frame)
 
                 if not created:
                     cv2.namedWindow(
@@ -886,12 +1082,105 @@ class PedestrianOverlayDisplay:
                 cv2.imshow(self.window_name, frame)
                 if cv2.waitKey(1) == 27:
                     self.running = False
+                next_frame_at = time.monotonic() + frame_interval_sec
         except Exception as exc:
             self.error = exc
             self.running = False
         finally:
+            if self.video_writer:
+                self.video_writer.release()
+                self.video_writer = None
             if created:
                 cv2.destroyWindow(self.window_name)
+
+    def _compute_video_fps(self):
+        if not self._frame_intervals:
+            return self.max_fps
+        average_interval = sum(self._frame_intervals) / len(self._frame_intervals)
+        return min(self.max_fps, max(1.0, 1.0 / max(average_interval, 1e-6)))
+
+    def write_video_frame(self, cv2, frame):
+        if self.video_output_path is None:
+            return
+
+        if self.video_writer is None:
+            if self._pending_first_frame is None:
+                self._pending_first_frame = frame.copy()
+                return
+
+            height, width = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            video_fps = self._compute_video_fps()
+            self.video_writer = cv2.VideoWriter(
+                str(self.video_output_path),
+                fourcc,
+                video_fps,
+                (width, height),
+            )
+            if not self.video_writer.isOpened():
+                self.video_writer = None
+                raise RuntimeError(
+                    f"Could not open FPV video writer: {self.video_output_path}"
+                )
+            print(f"Recording FPV video to {self.video_output_path} at {video_fps:.1f} FPS.")
+            self.video_writer.write(self._pending_first_frame)
+            self._pending_first_frame = None
+
+        self.video_writer.write(frame)
+
+    def draw_third_person_overlay(self, cv2, frame):
+        if not self.third_person_overlay or self.third_person_image is None:
+            return
+
+        inset = unpack_image(self.third_person_image)
+        if inset is None:
+            return
+        if inset.ndim == 2:
+            inset = cv2.cvtColor(inset, cv2.COLOR_GRAY2BGR)
+        elif inset.ndim == 3 and inset.shape[2] == 1:
+            inset = cv2.cvtColor(inset[:, :, 0], cv2.COLOR_GRAY2BGR)
+
+        frame_height, frame_width = frame.shape[:2]
+        inset_height, inset_width = inset.shape[:2]
+        if frame_height <= 0 or frame_width <= 0 or inset_height <= 0 or inset_width <= 0:
+            return
+
+        margin = self.third_person_overlay_margin_px
+        available_width = max(1, frame_width - (2 * margin))
+        available_height = max(1, frame_height - (2 * margin))
+        target_width = min(
+            available_width,
+            max(80, int(frame_width * self.third_person_overlay_width_frac)),
+        )
+        target_height = max(1, int(target_width * inset_height / inset_width))
+        max_height = max(1, int(frame_height * 0.42))
+        if target_height > max_height:
+            target_height = min(max_height, available_height)
+            target_width = max(1, int(target_height * inset_width / inset_height))
+
+        target_width = min(target_width, available_width)
+        target_height = min(target_height, available_height)
+        x0 = max(0, frame_width - margin - target_width)
+        y0 = max(0, margin)
+        x1 = min(frame_width, x0 + target_width)
+        y1 = min(frame_height, y0 + target_height)
+        if x1 <= x0 or y1 <= y0:
+            return
+
+        inset_resized = cv2.resize(inset, (x1 - x0, y1 - y0))
+        frame[y0:y1, x0:x1] = inset_resized
+        cv2.rectangle(frame, (x0, y0), (x1 - 1, y1 - 1), (255, 255, 255), 2)
+        cv2.rectangle(frame, (x0, y0), (x1 - 1, min(y1 - 1, y0 + 24)), (20, 20, 20), -1)
+        cv2.putText(
+            frame,
+            self.third_person_label,
+            (x0 + 8, y0 + 17),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
     def draw_pedestrian_overlay(self, cv2, frame, image):
         height, width = frame.shape[:2]
@@ -1094,11 +1383,51 @@ def start_front_rgb_display(client, drone, args, scene_name, sim_config_path):
         args.camera_fov_degrees,
     )
     window_name = f"Front RGB ({args.camera})"
+
+    third_person_topic = None
+    third_person_enabled = not args.no_third_person_overlay
+    if third_person_enabled:
+        try:
+            third_person_pose = make_third_person_camera_pose(
+                args.third_person_camera_distance_m,
+                args.third_person_camera_height_m,
+                args.third_person_camera_pitch_deg,
+            )
+            if drone.set_camera_pose(args.third_person_camera, third_person_pose):
+                print(
+                    f"Set {args.third_person_camera} third-person camera "
+                    f"{args.third_person_camera_distance_m:g}m behind, "
+                    f"{args.third_person_camera_height_m:g}m above, "
+                    f"pitch {args.third_person_camera_pitch_deg:g} degrees down."
+                )
+            else:
+                print(
+                    f"Warning: failed to set {args.third_person_camera} "
+                    "third-person camera pose; using configured pose."
+                )
+            third_person_topic = require_scene_camera_topic(
+                drone,
+                args.third_person_camera,
+            )
+        except Exception as exc:
+            print(
+                f"Third-person inset disabled because camera "
+                f"'{args.third_person_camera}' is not available: {exc}"
+            )
+            third_person_enabled = False
+
+    video_output_path = prepare_video_output_path(args.video_path)
     image_display = PedestrianOverlayDisplay(
         window_name,
         fov_degrees,
         resize_x=args.camera_display_width,
         resize_y=args.camera_display_height,
+        max_fps=args.max_fps,
+        video_output_path=video_output_path,
+        third_person_overlay=third_person_enabled,
+        third_person_overlay_width_frac=args.third_person_overlay_width_frac,
+        third_person_overlay_margin_px=args.third_person_overlay_margin_px,
+        third_person_label="3rd Person View",
         draw_box=not args.no_pedestrian_box,
     )
     image_display.start()
@@ -1106,10 +1435,18 @@ def start_front_rgb_display(client, drone, args, scene_name, sim_config_path):
         camera_topic,
         lambda _, image: image_display.receive(image),
     )
+    camera_topics = [camera_topic]
     print(f"Subscribed front RGB camera topic: {camera_topic}")
+    if third_person_enabled and third_person_topic:
+        client.subscribe(
+            third_person_topic,
+            lambda _, image: image_display.receive_third_person(image),
+        )
+        camera_topics.append(third_person_topic)
+        print(f"Subscribed third-person camera topic: {third_person_topic}")
     if not args.no_pedestrian_box:
         print(f"Drawing red pedestrian box using {fov_degrees:g} degree camera FOV.")
-    return image_display, camera_topic
+    return image_display, camera_topics
 
 
 async def run_keyboard_control(drone, world, args, pedestrian_display=None):
@@ -1295,7 +1632,7 @@ async def main():
 
     temp_scene_dir = None
     image_display = None
-    camera_topic = None
+    camera_topics = []
     drone = None
 
     client = projectairsim.ProjectAirSimClient(
@@ -1347,7 +1684,7 @@ async def main():
             set_pedestrian_speed(world, args.pedestrian, args.pedestrian_speed)
 
         if not args.no_camera:
-            image_display, camera_topic = start_front_rgb_display(
+            image_display, camera_topics = start_front_rgb_display(
                 client,
                 drone,
                 args,
@@ -1363,7 +1700,7 @@ async def main():
         return 1
 
     finally:
-        if camera_topic:
+        for camera_topic in camera_topics:
             try:
                 client.unsubscribe(camera_topic)
             except Exception:
