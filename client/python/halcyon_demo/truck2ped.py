@@ -13,6 +13,8 @@ Controls:
     Left/Right: drone yaw
     N: stop truck and start pedestrian crossing
     M: stop pedestrian and resume truck
+    Z: set pedestrian speed to 10
+    X: stop pedestrian
     L: land
     Q: quit
 
@@ -353,6 +355,7 @@ def build_parser():
     parser.add_argument("--truck-move-speed", type=float, default=700.0)
     parser.add_argument("--pedestrian-stop-speed", type=float, default=0.0)
     parser.add_argument("--pedestrian-walk-speed", type=float, default=0.3)
+    parser.add_argument("--pedestrian-z-speed", type=float, default=10.0)
     parser.add_argument("--flight-speed", type=float, default=5.0)
     parser.add_argument("--yaw-speed", type=float, default=20.0)
     parser.add_argument("--command-duration-sec", type=float, default=0.1)
@@ -620,6 +623,8 @@ async def run_keyboard_control(drone, world, args):
         f"M: pedestrian speed={args.pedestrian_stop_speed:g}, "
         f"truck TargetSpeed={args.truck_move_speed:g}"
     )
+    print(f"Z: pedestrian speed={args.pedestrian_z_speed:g}")
+    print(f"X: pedestrian speed={args.pedestrian_stop_speed:g}")
     print("L: land")
     print("Q: quit")
     if not args.no_live_ned:
@@ -630,6 +635,8 @@ async def run_keyboard_control(drone, world, args):
     last_live_ned_at = 0.0
     n_was_pressed = False
     m_was_pressed = False
+    z_was_pressed = False
+    x_was_pressed = False
 
     while keep_running:
         if not args.no_live_ned:
@@ -680,6 +687,24 @@ async def run_keyboard_control(drone, world, args):
             )
             set_truck_speed(world, args.truck, args.truck_move_speed)
         m_was_pressed = m_is_pressed
+
+        z_is_pressed = keyboard_module.is_pressed("z")
+        if z_is_pressed and not z_was_pressed:
+            set_pedestrian_speed(
+                world,
+                args.pedestrian,
+                args.pedestrian_z_speed,
+            )
+        z_was_pressed = z_is_pressed
+
+        x_is_pressed = keyboard_module.is_pressed("x")
+        if x_is_pressed and not x_was_pressed:
+            set_pedestrian_speed(
+                world,
+                args.pedestrian,
+                args.pedestrian_stop_speed,
+            )
+        x_was_pressed = x_is_pressed
 
         if keyboard_module.is_pressed("l"):
             await land(drone)
