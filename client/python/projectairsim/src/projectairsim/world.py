@@ -544,13 +544,18 @@ class World(object):
         return self.client.request(set_actor_property_req)
 
     def set_truck_speed(self, actor_name_or_tag: str, speed: float) -> bool:
-        """Set a BP_Truck speed through SetTruckSpeed, falling back to Speed."""
+        """Set a BP_Truck target speed through SetTruckSpeed.
+
+        BP_Truck Tick owns acceleration/braking by interpolating CurrentSpeed
+        toward TargetSpeed. The fallback updates TargetSpeed directly and never
+        overwrites CurrentSpeed or teleports the truck.
+        """
         called = self.call_actor_event(
             actor_name_or_tag, "SetTruckSpeed", {"NewSpeed": speed}
         )
         if called:
             return True
-        return self.set_actor_float_property(actor_name_or_tag, "Speed", speed)
+        return self.set_actor_float_property(actor_name_or_tag, "TargetSpeed", speed)
 
     def spawn_object(
         self,
