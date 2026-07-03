@@ -11,8 +11,8 @@ Controls:
     A/D: drone left/right
     Up/Down: drone up/down
     Left/Right: drone yaw
-    N: stop truck and start pedestrian crossing
-    M: stop pedestrian and resume truck
+    N: stop truck
+    M: set truck speed to 100
     Z: set pedestrian speed to 10
     X: stop pedestrian
     L: land
@@ -352,7 +352,7 @@ def build_parser():
         help="Optional initial PedestrianSpeed before keyboard control starts.",
     )
     parser.add_argument("--truck-stop-speed", type=float, default=0.0)
-    parser.add_argument("--truck-move-speed", type=float, default=700.0)
+    parser.add_argument("--truck-move-speed", type=float, default=100.0)
     parser.add_argument("--pedestrian-stop-speed", type=float, default=0.0)
     parser.add_argument("--pedestrian-walk-speed", type=float, default=0.3)
     parser.add_argument("--pedestrian-z-speed", type=float, default=10.0)
@@ -615,14 +615,8 @@ async def run_keyboard_control(drone, world, args):
     print("A/D: drone left/right")
     print("Up/Down: drone up/down")
     print("Left/Right: drone yaw")
-    print(
-        f"N: truck TargetSpeed={args.truck_stop_speed:g}, "
-        f"pedestrian speed={args.pedestrian_walk_speed:g}"
-    )
-    print(
-        f"M: pedestrian speed={args.pedestrian_stop_speed:g}, "
-        f"truck TargetSpeed={args.truck_move_speed:g}"
-    )
+    print(f"N: truck TargetSpeed={args.truck_stop_speed:g}")
+    print(f"M: truck TargetSpeed={args.truck_move_speed:g}")
     print(f"Z: pedestrian speed={args.pedestrian_z_speed:g}")
     print(f"X: pedestrian speed={args.pedestrian_stop_speed:g}")
     print("L: land")
@@ -671,20 +665,10 @@ async def run_keyboard_control(drone, world, args):
         n_is_pressed = keyboard_module.is_pressed("n")
         if n_is_pressed and not n_was_pressed:
             set_truck_speed(world, args.truck, args.truck_stop_speed)
-            set_pedestrian_speed(
-                world,
-                args.pedestrian,
-                args.pedestrian_walk_speed,
-            )
         n_was_pressed = n_is_pressed
 
         m_is_pressed = keyboard_module.is_pressed("m")
         if m_is_pressed and not m_was_pressed:
-            set_pedestrian_speed(
-                world,
-                args.pedestrian,
-                args.pedestrian_stop_speed,
-            )
             set_truck_speed(world, args.truck, args.truck_move_speed)
         m_was_pressed = m_is_pressed
 
