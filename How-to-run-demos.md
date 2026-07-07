@@ -67,3 +67,16 @@ Approach a tree: 72.0,-8.0,-4.0; 69.93,-5.19,-5.36; 66.98,1.81,-4.61; 64.38,6.0,
 Path through the tree: 61.0, 10.0, -4.5; 58.0, 14.0, -5.0; 55.0, 18.0, -5.5;
 Continue: 45.0, 17.0, -13.0; 36.0, 17.0, -13.0;34.0, 19.0, -15.0;32.0, 21.0, -17.0;30.0, 23.0, -19.0;28.0, 25.0, -21.0;25.0, 27.0, -21.0;22.0, 30.0, -21.0;19.0, 33.0, -21.0;16.0, 36.0, -21.0;13.0, 39.0, -21.0;10.0, 42.0, -21.0;7.0, 45.0, -21.0;4.0, 48.0, -21.0;1.0, 51.0, -21.0;-2.0, 54.0, -21.0;-5.0, 57.0, -21.0;-8.0, 60.0, -21.0;-11.0, 63.0, -21.0;-14.0, 66.0, -21.0;-17.0, 69.0, -21.0;-20.0, 71.0, -21.0;-23.0, 71.0, -21.0;-26.0, 72.0, -22.0;-29.0, 72.0, -22.0;-32.0, 72.0, -22.0;-35.0, 72.0, -22.0;-38.0, 72.0, -22.0;-41.0, 72.0, -22.0;-43.0, 74.0, -24.0;-46.0, 75.0, -25.0;-50.0, 76.0, -25.
 ```
+
+## How to run truck2ped.py demo
+1. Open the WalkingNPCs.uproject in Unreal Engine Editor and press play button.
+2. After the scene is loaded, run PX4 using `make px4_sitl_default none_iris`. If the demo waits on TCP port 4560, restart PX4 after Unreal is already playing.
+3. Run
+```python
+python truck2ped.py `
+  --start 0 0 -2 `
+  --camera-capture-width 1920 `
+  --camera-capture-height 1080 `
+  --camera-display-width 1920 `
+  --camera-display-height 1080
+```
