@@ -518,7 +518,22 @@ def ensure_requested_camera(robot_config: Dict, camera_sensor_id: str, args) -> 
         ensure_scene_camera_capture(sensor, args)
 
 
-def make_runtime_scene_config(args, camera_sensor_id: str):
+def disable_camera_sensors(robot_config: Dict) -> int:
+    disabled_count = 0
+    for sensor in robot_config.get("sensors", []):
+        if sensor.get("type") != "camera":
+            continue
+
+        sensor["enabled"] = False
+        disabled_count += 1
+        for capture in sensor.get("capture-settings", []):
+            capture["capture-enabled"] = False
+            capture["streaming-enabled"] = False
+
+    return disabled_count
+
+
+def make_runtime_scene_config(args, camera_sensor_id: Optional[str]):
     scene_path = resolve_config_path(args.scene, args.sim_config_path)
     if not scene_path.exists():
         raise FileNotFoundError(f"Scene config not found: {scene_path}")
@@ -556,7 +571,15 @@ def make_runtime_scene_config(args, camera_sensor_id: str):
                 str(scene_path.parent),
             )
             robot_config = load_jsonc(robot_config_path)
-            if actor is target_actor:
+            if args.headless:
+                disabled_count = disable_camera_sensors(robot_config)
+                if disabled_count:
+                    projectairsim_log().info(
+                        "Headless runtime config disabled %d camera sensor(s) for %s",
+                        disabled_count,
+                        actor.get("name", f"robot actor {actor_index}"),
+                    )
+            elif actor is target_actor:
                 ensure_requested_camera(robot_config, camera_sensor_id, args)
                 if args.third_person_overlay:
                     ensure_requested_camera(
@@ -2791,8 +2814,21 @@ async def await_drone_task(
 
 
 async def run_overlay(args):
-    camera_sensor_id = camera_arg_to_sensor_id(args.camera)
-    third_person_camera_sensor_id = camera_arg_to_sensor_id(args.third_person_camera)
+    if args.headless:
+        args.video_path = None
+        args.third_person_overlay = False
+        args.keep_overlay_after_mission = False
+        args.no_world_markers = True
+        if args.camera_angle_deg is not None:
+            projectairsim_log().warning(
+                "--camera-angle-deg is ignored when --headless is enabled"
+            )
+            args.camera_angle_deg = None
+
+    camera_sensor_id = None if args.headless else camera_arg_to_sensor_id(args.camera)
+    third_person_camera_sensor_id = (
+        None if args.headless else camera_arg_to_sensor_id(args.third_person_camera)
+    )
     if args.route and args.start is None:
         args.start = args.route[0]
     has_explicit_flight_target = bool(
@@ -2817,7 +2853,14 @@ async def run_overlay(args):
     cleanup_needed = False
 
     try:
-        video_output_path = prepare_video_output_path(args.video_path)
+        video_output_path = None
+        if args.headless:
+            projectairsim_log().info(
+                "Headless route flight enabled: no OpenCV preview, camera "
+                "subscriptions, or FPV video recording."
+            )
+        else:
+            video_output_path = prepare_video_output_path(args.video_path)
         temp_config_dir, effective_scene, effective_sim_config_path = (
             make_runtime_scene_config(args, camera_sensor_id)
         )
@@ -2842,7 +2885,7 @@ async def run_overlay(args):
             drone.set_pose(make_pose_ned(args.start), reset_kinematics=True)
             await asyncio.sleep(args.after_teleport_delay_sec)
 
-        if args.camera_angle_deg is not None:
+        if not args.headless and args.camera_angle_deg is not None:
             pose = make_camera_angle_pose(args, camera_sensor_id, args.camera_angle_deg)
             if not drone.set_camera_pose(camera_sensor_id, pose):
                 raise RuntimeError(
@@ -2856,7 +2899,7 @@ async def run_overlay(args):
             )
 
         third_person_topic = None
-        if args.third_person_overlay:
+        if not args.headless and args.third_person_overlay:
             try:
                 third_person_pose = make_third_person_camera_pose(
                     args.third_person_camera_distance_m,
@@ -2911,43 +2954,46 @@ async def run_overlay(args):
 
         plot_world_waypoint_markers(world, waypoints, args)
 
-        camera_topic = require_scene_camera_topic(drone, camera_sensor_id)
-        fov_degrees = read_camera_fov_degrees(
-            effective_scene,
-            effective_sim_config_path,
-            args.drone_name,
-            camera_sensor_id,
-            args.camera_fov_degrees,
-        )
-        window_name = f"FPV {args.camera} ({camera_sensor_id})"
-        display = FpvWaypointOverlayDisplay(
-            window_name,
-            waypoints,
-            fov_degrees,
-            args.preview_width,
-            args.preview_height,
-            not args.no_edge_indicators,
-            args.waypoint_acceptance_m,
-            args.max_fps,
-            video_output_path,
-            args.third_person_overlay,
-            args.third_person_overlay_width_frac,
-            args.third_person_overlay_margin_px,
-            "3rd Person View - Chase Camera",
-        )
-        display.start()
-        client.subscribe(camera_topic, lambda _, image: display.receive(image))
-        projectairsim_log().info("Subscribed FPV camera topic: %s", camera_topic)
-        if args.third_person_overlay and third_person_topic:
-            client.subscribe(
-                third_person_topic,
-                lambda _, image: display.receive_third_person(image),
+        if not args.headless:
+            camera_topic = require_scene_camera_topic(drone, camera_sensor_id)
+            fov_degrees = read_camera_fov_degrees(
+                effective_scene,
+                effective_sim_config_path,
+                args.drone_name,
+                camera_sensor_id,
+                args.camera_fov_degrees,
             )
-            projectairsim_log().info(
-                "Subscribed third-person overlay camera topic: %s",
-                third_person_topic,
+            window_name = f"FPV {args.camera} ({camera_sensor_id})"
+            display = FpvWaypointOverlayDisplay(
+                window_name,
+                waypoints,
+                fov_degrees,
+                args.preview_width,
+                args.preview_height,
+                not args.no_edge_indicators,
+                args.waypoint_acceptance_m,
+                args.max_fps,
+                video_output_path,
+                args.third_person_overlay,
+                args.third_person_overlay_width_frac,
+                args.third_person_overlay_margin_px,
+                "3rd Person View - Chase Camera",
             )
-        projectairsim_log().info("Press Esc in the OpenCV window or Ctrl+C to stop")
+            display.start()
+            client.subscribe(camera_topic, lambda _, image: display.receive(image))
+            projectairsim_log().info("Subscribed FPV camera topic: %s", camera_topic)
+            if args.third_person_overlay and third_person_topic:
+                client.subscribe(
+                    third_person_topic,
+                    lambda _, image: display.receive_third_person(image),
+                )
+                projectairsim_log().info(
+                    "Subscribed third-person overlay camera topic: %s",
+                    third_person_topic,
+                )
+            projectairsim_log().info("Press Esc in the OpenCV window or Ctrl+C to stop")
+        else:
+            projectairsim_log().info("Headless route flight ready; press Ctrl+C to stop")
 
         if not args.skip_takeoff:
             await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
@@ -3092,6 +3138,24 @@ async def run_overlay(args):
         elif args.wait_for_px4_ready:
             await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
 
+        if args.headless:
+            if args.duration_sec <= 0:
+                return
+
+            started_at = time.time()
+            last_report_at = 0.0
+            while time.time() - started_at < args.duration_sec:
+                elapsed = time.time() - started_at
+                if elapsed - last_report_at >= args.report_every_sec:
+                    actual = get_pose_position_ned(drone)
+                    projectairsim_log().info(
+                        "Headless route flight holding; pose NED %s",
+                        format_vector3(actual),
+                    )
+                    last_report_at = elapsed
+                await asyncio.sleep(0.2)
+            return
+
         started_at = time.time()
         last_report_at = 0.0
         while args.duration_sec <= 0 or time.time() - started_at < args.duration_sec:
@@ -3150,7 +3214,20 @@ async def run_overlay(args):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Show a drone FPV RGB camera with visible waypoint overlays."
+        description=(
+            "Fly a supplied route with optional static-obstacle replanning. "
+            "By default this shows an FPV overlay; use --headless for batch runs."
+        )
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help=(
+            "Run the route flight without OpenCV preview, camera subscriptions, "
+            "world markers, third-person overlay, or FPV video recording. The "
+            "runtime scene config disables camera sensors but keeps PX4 sensors "
+            "such as IMU, GPS, barometer, and magnetometer enabled."
+        ),
     )
     parser.add_argument(
         "--camera",
