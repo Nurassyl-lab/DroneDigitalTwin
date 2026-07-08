@@ -293,12 +293,28 @@ def write_jsonc(path, data):
     Path(path).write_text(commentjson.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def normalize_video_path_arg(video_path):
+    if video_path is None:
+        return None
+
+    normalized = str(video_path).strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in ("'", '"')
+    ):
+        normalized = normalized[1:-1].strip()
+
+    return normalized or None
+
+
 def prepare_video_output_path(video_path):
-    if video_path is None or str(video_path) == "":
+    normalized_video_path = normalize_video_path_arg(video_path)
+    if normalized_video_path is None:
         print("FPV video recording disabled.")
         return None
 
-    requested_path = Path(video_path).expanduser()
+    requested_path = Path(normalized_video_path).expanduser()
     if requested_path.suffix.lower() == ".mp4":
         output_dir = requested_path.parent
         output_path = requested_path
