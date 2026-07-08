@@ -33,6 +33,9 @@ from projectairsim.utils import (
     unpack_image,
 )
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_SIM_CONFIG_PATH = SCRIPT_DIR.parent / "example_user_scripts" / "sim_config"
+
 # px4_astar_autopilot is located in ../example_user_scripts/px4_astar_autopilot.py, so we add that directory to sys.path to import it
 # W:\UnsyncProjects\DroneSimDev\client\python\
 sys.path.append(
@@ -3199,7 +3202,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--video-path",
-        default="/DroneDigitalTwin/video",
+        default=str(SCRIPT_DIR / "video"),
         help=(
             "Directory for timestamped FPV MP4 recordings, or an explicit .mp4 "
             "file path. Use an empty string to disable recording."
