@@ -369,12 +369,28 @@ def resolve_config_path(config_name: str, sim_config_path: str) -> Path:
     return candidates[0]
 
 
-def prepare_video_output_path(video_path: str) -> Optional[Path]:
-    if not video_path:
+def normalize_video_path_arg(video_path: Optional[str]) -> Optional[str]:
+    if video_path is None:
+        return None
+
+    normalized = str(video_path).strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in ("'", '"')
+    ):
+        normalized = normalized[1:-1].strip()
+
+    return normalized or None
+
+
+def prepare_video_output_path(video_path: Optional[str]) -> Optional[Path]:
+    normalized_video_path = normalize_video_path_arg(video_path)
+    if normalized_video_path is None:
         projectairsim_log().info("FPV video recording disabled")
         return None
 
-    requested_path = Path(video_path).expanduser()
+    requested_path = Path(normalized_video_path).expanduser()
     if requested_path.suffix.lower() == ".mp4":
         output_dir = requested_path.parent
         output_path = requested_path
