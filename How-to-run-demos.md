@@ -80,3 +80,72 @@ python truck2ped.py `
   --camera-display-width 1920 `
   --camera-display-height 1080
 ```
+
+## How to run random_path_flight.py demo
+
+This demo runs random route flights without GUI preview, camera sensors, or video recording. It records only flight dynamics as per-run CSV files plus metadata JSON files.
+
+1. Start the River-side Forest Unreal project headless. Use `-nullrhi` for the fastest no-render run:
+
+```powershell
+& "W:\Programs\EpicGame\Engine\UE_5.7\Engine\Binaries\Win64\UnrealEditor.exe" `
+  "W:\UnsyncProjects\DroneSimDev\unreal\LowPolyRiverForest\ForestDomeEnv.uproject" `
+  -game -nullrhi -nosound -NoVSync -log
+```
+
+If Project AirSim does not load correctly with `-nullrhi`, use `-RenderOffScreen` instead.
+
+2. After the scene is loaded, start PX4:
+
+```bash
+make px4_sitl_default none_iris
+```
+
+3. Run a small random batch first:
+
+```powershell
+cd W:\UnsyncProjects\DroneSimDev\client\python\halcyon_demo
+
+& W:\Programs\Miniconda3\Scripts\conda.exe run -p W:\UnsyncProjects\DroneSimDev\DroneSimDev_ENV python random_path_flight.py `
+  --random-runs 5 `
+  --random-seed 1234 `
+  --random-x-range "-50,72" `
+  --random-y-range "-20,80" `
+  --random-z-range "-28,-4" `
+  --random-intermediate-waypoints 10 `
+  --random-xy-jitter-m 8 `
+  --random-z-jitter-m 3 `
+  --px4-ready-timeout-sec 300 `
+  --flight-driver velocity `
+  --velocity-mps 3 `
+  --velocity-lookahead-m 8 `
+  --path-yaw-rate-dps 10 `
+  --path-yaw-deadband-deg 5 `
+  --path-yaw-response-sec 1.5 `
+  --no-replan-on-object `
+  --flight-dynamics-sample-interval-sec 0.1
+```
+
+For hundreds of runs, increase `--random-runs` after the 5-run test succeeds:
+
+```python
+python random_path_flight.py `
+  --random-runs 200 `
+  --random-seed 20000 `
+  --random-x-range "-50,72" `
+  --random-y-range "-20,80" `
+  --random-z-range "-28,-4" `
+  --random-intermediate-waypoints 10 `
+  --px4-ready-timeout-sec 300 `
+  --flight-driver velocity `
+  --velocity-mps 3 `
+  --no-replan-on-object `
+  --continue-on-error
+```
+
+Outputs are written to `W:\UnsyncProjects\DroneSimDev\flight_dynamics\random_path_flight` by default:
+
+- `run_0001_dynamics.csv`, `run_0002_dynamics.csv`, ...
+- `run_0001_metadata.json`, `run_0002_metadata.json`, ...
+
+Use `--flight-dynamics-output-dir "W:\path\to\output"` to choose a different folder. If the run waits on TCP port `4560`, restart PX4 after Unreal is already running.
