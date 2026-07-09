@@ -1595,6 +1595,44 @@ class FlightDynamicsRecorder:
         }
 
 
+class LiveNedPrinter:
+    def __init__(self, run_index: int, interval_sec: float):
+        self.run_index = run_index
+        self.interval_sec = max(0.05, interval_sec)
+        self.started_at = 0.0
+        self.running = False
+        self.task = None
+
+    async def start(self, drone: Drone) -> None:
+        self.started_at = time.time()
+        self.running = True
+        self.task = asyncio.create_task(self._print_loop(drone))
+
+    async def stop(self) -> None:
+        self.running = False
+        if self.task:
+            await self.task
+            self.task = None
+
+    async def _print_loop(self, drone: Drone) -> None:
+        while self.running:
+            try:
+                position = get_pose_position_ned(drone)
+                elapsed = time.time() - self.started_at
+                print(
+                    f"[LIVE NED run={self.run_index:04d} {elapsed:7.1f}s] "
+                    f"x={position[0]:8.2f} y={position[1]:8.2f} z={position[2]:8.2f}",
+                    flush=True,
+                )
+            except Exception as exc:
+                projectairsim_log().warning(
+                    "Live NED print failed for run %d: %s",
+                    self.run_index,
+                    exc,
+                )
+            await asyncio.sleep(self.interval_sec)
+
+
 async def request_px4_control(drone: Drone):
     projectairsim_log().info("Requesting PX4 control for direct movement")
     request_control_task = await drone.request_control_async()
@@ -3083,6 +3121,7 @@ async def run_overlay(args):
     display = None
     drone = None
     dynamics_recorder = None
+    live_ned_printer = None
     cleanup_needed = False
 
     try:
@@ -3110,6 +3149,12 @@ async def run_overlay(args):
             sim_config_path=effective_sim_config_path,
         )
         drone = Drone(client, world, args.drone_name)
+        if args.live_ned:
+            live_ned_printer = LiveNedPrinter(
+                args.random_run_index,
+                args.live_ned_interval_sec,
+            )
+            await live_ned_printer.start(drone)
 
         if args.teleport_start:
             if args.start is None:
@@ -3446,6 +3491,8 @@ async def run_overlay(args):
             )
 
     finally:
+        if live_ned_printer:
+            await live_ned_printer.stop()
         if dynamics_recorder:
             exc_type, exc, _ = sys.exc_info()
             await dynamics_recorder.stop(
@@ -3543,6 +3590,7 @@ def build_parser() -> argparse.ArgumentParser:
         headless=True,
         random_run_index=1,
         current_random_seed=None,
+        live_ned=True,
     )
     parser.add_argument(
         "--headless",
@@ -3643,6 +3691,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Ground-truth kinematics CSV sampling interval.",
+    )
+    parser.add_argument(
+        "--live-ned-interval-sec",
+        type=float,
+        default=1.0,
+        help="How often to print the live drone NED position to the Python console.",
+    )
+    parser.add_argument(
+        "--no-live-ned",
+        dest="live_ned",
+        action="store_false",
+        help="Disable live NED position printing.",
     )
     parser.add_argument(
         "--camera",
