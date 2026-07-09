@@ -102,13 +102,15 @@ If Project AirSim does not load correctly with `-nullrhi`, use `-RenderOffScreen
 make px4_sitl_default none_iris
 ```
 
-3. Run a small random batch first:
+3. Run a small random batch first. `--fix-start` keeps every launch at `72.0,-8.0,-4.0` while each route end point is random:
 `cd W:\UnsyncProjects\DroneSimDev\client\python\halcyon_demo`
 
 ```python
 python random_path_flight.py `
   --random-runs 5 `
   --random-seed 1234 `
+  --fix-start `
+  --fixed-start "72.0,-8.0,-4.0" `
   --random-x-range "-50,72" `
   --random-y-range "-20,80" `
   --random-z-range "-28,-4" `
@@ -132,6 +134,8 @@ For hundreds of runs, increase `--random-runs` after the 5-run test succeeds:
 python random_path_flight.py `
   --random-runs 200 `
   --random-seed 20000 `
+  --fix-start `
+  --fixed-start "72.0,-8.0,-4.0" `
   --random-x-range "-50,72" `
   --random-y-range "-20,80" `
   --random-z-range "-28,-4" `
