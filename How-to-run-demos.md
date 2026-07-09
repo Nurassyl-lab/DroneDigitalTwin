@@ -87,6 +87,7 @@ This demo runs random route flights without GUI preview, camera sensors, or vide
 
 1. Start the River-side Forest Unreal project headless. Use `-nullrhi` for the fastest no-render run:
 
+*replace path with your actual path*
 ```powershell
 & "W:\Programs\EpicGame\Engine\UE_5.7\Engine\Binaries\Win64\UnrealEditor.exe" `
   "W:\UnsyncProjects\DroneSimDev\unreal\LowPolyRiverForest\ForestDomeEnv.uproject" `
@@ -102,11 +103,10 @@ make px4_sitl_default none_iris
 ```
 
 3. Run a small random batch first:
+`cd W:\UnsyncProjects\DroneSimDev\client\python\halcyon_demo`
 
-```powershell
-cd W:\UnsyncProjects\DroneSimDev\client\python\halcyon_demo
-
-& W:\Programs\Miniconda3\Scripts\conda.exe run -p W:\UnsyncProjects\DroneSimDev\DroneSimDev_ENV python random_path_flight.py `
+```python
+python random_path_flight.py `
   --random-runs 5 `
   --random-seed 1234 `
   --random-x-range "-50,72" `
