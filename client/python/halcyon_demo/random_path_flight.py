@@ -3635,7 +3635,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--flight-dynamics-output-dir",
-        default=str(DEFAULT_FLIGHT_DYNAMICS_DIR),
+        default=str(SCRIPT_DIR / "flight_dynamics"),
         help="Directory for per-run flight dynamics CSV and metadata JSON files.",
     )
     parser.add_argument(
