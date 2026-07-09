@@ -180,20 +180,29 @@ def format_route_arg(route: Sequence[Sequence[float]]) -> str:
 
 def generate_random_route(args, rng: random.Random) -> List[List[float]]:
     min_distance_m = max(0.0, args.random_min_start_end_distance_m)
+    start = (
+        [float(value) for value in args.fixed_start]
+        if args.fix_start
+        else None
+    )
     for _ in range(100):
-        start = random_ned_point(
-            rng,
-            args.random_x_range,
-            args.random_y_range,
-            args.random_z_range,
-        )
+        if start is None:
+            candidate_start = random_ned_point(
+                rng,
+                args.random_x_range,
+                args.random_y_range,
+                args.random_z_range,
+            )
+        else:
+            candidate_start = start
         end = random_ned_point(
             rng,
             args.random_x_range,
             args.random_y_range,
             args.random_z_range,
         )
-        if distance_between(start, end) >= min_distance_m:
+        if distance_between(candidate_start, end) >= min_distance_m:
+            start = candidate_start
             break
     else:
         raise RuntimeError(
@@ -238,6 +247,7 @@ def normalize_vector_args(argv: Sequence[str]) -> List[str]:
         "--random-x-range",
         "--random-y-range",
         "--random-z-range",
+        "--fixed-start",
         "--replan-rejoin-point",
         "--replan-emergency-node",
     }
@@ -3669,6 +3679,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=35.0,
         help="Minimum distance between sampled random start and end points.",
+    )
+    parser.add_argument(
+        "--fix-start",
+        action="store_true",
+        help=(
+            "Use the same launch/start NED for every generated route. The end "
+            "point and intermediate waypoints remain random."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-start",
+        type=parse_vector3,
+        default=[72.0, -8.0, -4.0],
+        metavar="N,E,D",
+        help="Fixed NED start used with --fix-start.",
     )
     parser.add_argument(
         "--between-run-delay-sec",
