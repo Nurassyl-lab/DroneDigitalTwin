@@ -403,4 +403,4 @@ client/python/example_user_scripts/sim_config/*_runtime_start.jsonc
 *.mp4
 unreal/RealPlace
 unreal/WalkingNPCs
-client/python/halcyon_demo/flight_dynamics/random_path_flight
+client/python/halcyon_demo/flight_dynamics
