@@ -241,6 +241,10 @@ def wrap_angle_rad(angle: float) -> float:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def heading_deg_360(yaw_rad: float) -> float:
+    return math.degrees(yaw_rad) % 360.0
+
+
 def yaw_from_quaternion(rotation) -> float:
     w = float(rotation["w"])
     x = float(rotation["x"])
@@ -258,6 +262,58 @@ def get_pose_yaw_ned(drone: Drone) -> float:
     if rotation is None:
         return 0.0
     return yaw_from_quaternion(rotation)
+
+
+def get_ground_truth_velocity_ned(drone: Drone) -> List[float]:
+    twist = drone.get_ground_truth_kinematics().get("twist", {})
+    linear = twist.get("linear", {})
+    return [
+        float(linear.get("x", 0.0)),
+        float(linear.get("y", 0.0)),
+        float(linear.get("z", 0.0)),
+    ]
+
+
+def parse_teleport_input(value: str) -> Tuple[List[float], float]:
+    parts = value.replace(",", " ").split()
+    if len(parts) not in (3, 4):
+        raise ValueError("expected x,y,z or x,y,z,yaw_deg")
+
+    numbers = [float(part) for part in parts]
+    yaw_rad = math.radians(numbers[3]) if len(numbers) == 4 else None
+    return numbers[:3], yaw_rad
+
+
+async def prompt_keyboard_teleport(
+    drone: Drone,
+    current_yaw_rad: float,
+    live_ned=None,
+    flight_trace=None,
+    label: str = "Keyboard teleport",
+) -> Tuple[List[float], float]:
+    prompt = "\nTeleport NED x,y,z[,yaw_deg] (blank/cancel to skip): "
+    value = (await asyncio.to_thread(input, prompt)).strip()
+    if not value or value.lower() in {"c", "cancel", "q", "quit"}:
+        projectairsim_log().info("Teleport cancelled")
+        return get_pose_position_ned(drone), current_yaw_rad
+
+    target, yaw_rad = parse_teleport_input(value)
+    if yaw_rad is None:
+        yaw_rad = current_yaw_rad
+
+    drone.set_pose(make_pose_ned_yaw(target, yaw_rad), reset_kinematics=True)
+    await asyncio.sleep(0.05)
+    actual = get_pose_position_ned(drone)
+    if flight_trace:
+        flight_trace.record(label, actual, force=True)
+    if live_ned:
+        live_ned.show(label, actual, target=target, remaining_m=0.0, force=True)
+    projectairsim_log().info(
+        "Teleported to NED %s heading=%.1f deg",
+        format_vector3(actual),
+        heading_deg_360(yaw_rad),
+    )
+    return actual, yaw_rad
 
 
 async def teleport_and_verify(
@@ -837,7 +893,10 @@ async def run_px4_keyboard_control(
     min_speed_mps = max(0.0, min_speed_mps)
     current_speed_mps = max(velocity_mps, min_speed_mps)
     last_speed_adjust_time = 0.0
+    last_teleport_time = 0.0
+    last_status_time = 0.0
     speed_adjust_debounce_sec = 0.25
+    teleport_debounce_sec = 0.5
     commanded_velocity = [0.0, 0.0, 0.0]
     commanded_yaw_rate = 0.0
 
@@ -847,6 +906,7 @@ async def run_px4_keyboard_control(
     print("Up/Down Arrows: up/down altitude")
     print("Left/Right Arrows: yaw left/right")
     print("K/L: increase/decrease speed")
+    print("T: teleport to NED x,y,z[,yaw_deg]")
     print("X: land and exit")
     print("Q: quit without landing")
     print(f"Speed: {current_speed_mps:.1f} m/s")
@@ -876,6 +936,23 @@ async def run_px4_keyboard_control(
             current_speed_mps = max(min_speed_mps, current_speed_mps - speed_step_mps)
             projectairsim_log().info("Keyboard speed: %.1f m/s", current_speed_mps)
             last_speed_adjust_time = now
+
+        if keyboard_module.is_pressed("t") and (
+            now - last_teleport_time >= teleport_debounce_sec
+        ):
+            try:
+                await prompt_keyboard_teleport(
+                    drone,
+                    get_pose_yaw_ned(drone),
+                    live_ned,
+                    flight_trace,
+                )
+                commanded_velocity = [0.0, 0.0, 0.0]
+                commanded_yaw_rate = 0.0
+            except ValueError as exc:
+                projectairsim_log().info("Teleport ignored: %s", exc)
+            last_teleport_time = time.time()
+            continue
 
         if keyboard_module.is_pressed("w"):
             target_velocity[0] = current_speed_mps
@@ -942,6 +1019,17 @@ async def run_px4_keyboard_control(
                 yaw=math.radians(commanded_yaw_rate),
             )
 
+        if now - last_status_time >= 1.0:
+            actual_velocity = get_ground_truth_velocity_ned(drone)
+            projectairsim_log().info(
+                "Heading=%.1f deg requested=%.1f commanded=%.1f actual=%.1f m/s",
+                heading_deg_360(get_pose_yaw_ned(drone)),
+                current_speed_mps,
+                vector_magnitude(commanded_velocity),
+                vector_magnitude(actual_velocity),
+            )
+            last_status_time = now
+
         await asyncio.sleep(0.02)
 
 
@@ -959,7 +1047,9 @@ async def run_direct_keyboard_control(
     min_speed_mps = max(0.0, min_speed_mps)
     current_speed_mps = max(velocity_mps, min_speed_mps)
     speed_adjust_debounce_sec = 0.25
+    teleport_debounce_sec = 0.5
     last_speed_adjust_time = 0.0
+    last_teleport_time = 0.0
     last_status_time = 0.0
     position = get_pose_position_ned(drone)
     yaw_rad = get_pose_yaw_ned(drone)
@@ -971,6 +1061,7 @@ async def run_direct_keyboard_control(
     print("Up/Down Arrows: up/down altitude")
     print("Left/Right Arrows: yaw left/right")
     print("K/L: increase/decrease speed")
+    print("T: teleport to NED x,y,z[,yaw_deg]")
     print("X/Q: exit")
     print(f"Speed: {current_speed_mps:.1f} m/s")
     print("Speed cap: unbounded")
@@ -993,6 +1084,22 @@ async def run_direct_keyboard_control(
             current_speed_mps = max(min_speed_mps, current_speed_mps - speed_step_mps)
             projectairsim_log().info("Keyboard speed: %.1f m/s", current_speed_mps)
             last_speed_adjust_time = now
+
+        if keyboard_module.is_pressed("t") and (
+            now - last_teleport_time >= teleport_debounce_sec
+        ):
+            try:
+                position, yaw_rad = await prompt_keyboard_teleport(
+                    drone,
+                    yaw_rad,
+                    live_ned,
+                    flight_trace,
+                )
+                last_tick_time = time.time()
+            except ValueError as exc:
+                projectairsim_log().info("Teleport ignored: %s", exc)
+            last_teleport_time = time.time()
+            continue
 
         if keyboard_module.is_pressed("q") or keyboard_module.is_pressed("x"):
             projectairsim_log().info("Direct keyboard requested exit")
@@ -1037,7 +1144,8 @@ async def run_direct_keyboard_control(
             live_ned.show("Direct keyboard control", position)
         if now - last_status_time >= 1.0:
             projectairsim_log().info(
-                "Direct speed requested=%.1f actual=%.1f m/s",
+                "Heading=%.1f deg direct speed requested=%.1f actual=%.1f m/s",
+                heading_deg_360(yaw_rad),
                 current_speed_mps,
                 vector_magnitude(world_velocity),
             )
