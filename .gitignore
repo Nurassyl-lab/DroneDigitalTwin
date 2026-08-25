@@ -404,3 +404,4 @@ client/python/example_user_scripts/sim_config/*_runtime_start.jsonc
 unreal/RealPlace
 unreal/WalkingNPCs
 client/python/halcyon_demo/flight_dynamics
+unreal/OffShoreWindFarm/
