@@ -74,8 +74,36 @@ def make_pose_ned(position_ned: Sequence[float]) -> Pose:
     )
 
 
+def make_pose_ned_yaw(position_ned: Sequence[float], yaw_rad: float) -> Pose:
+    half_yaw = yaw_rad / 2.0
+    return Pose(
+        {
+            "translation": Vector3(
+                {
+                    "x": position_ned[0],
+                    "y": position_ned[1],
+                    "z": position_ned[2],
+                }
+            ),
+            "rotation": Quaternion(
+                {
+                    "w": math.cos(half_yaw),
+                    "x": 0.0,
+                    "y": 0.0,
+                    "z": math.sin(half_yaw),
+                }
+            ),
+            "frame_id": "DEFAULT_ID",
+        }
+    )
+
+
 def format_scene_origin_xyz(position_ned: Sequence[float]) -> str:
     return " ".join(f"{component:g}" for component in position_ned)
+
+
+def format_scene_origin_rpy(yaw_deg: float) -> str:
+    return f"0 0 {yaw_deg:g}"
 
 
 def resolve_scene_config_path(scene: str, sim_config_path: str) -> Path:
@@ -100,6 +128,7 @@ def create_start_origin_scene_config(
     sim_config_path: str,
     drone_name: str,
     start: Sequence[float],
+    start_yaw_deg: float,
 ) -> Tuple[str, str, Path]:
     source_path = resolve_scene_config_path(scene, sim_config_path)
     if not source_path.exists():
@@ -119,6 +148,7 @@ def create_start_origin_scene_config(
 
     origin = target_actor.setdefault("origin", {})
     origin["xyz"] = format_scene_origin_xyz(start)
+    origin["rpy-deg"] = format_scene_origin_rpy(start_yaw_deg)
 
     output_name = f"{source_path.stem}_runtime_start{source_path.suffix or '.jsonc'}"
     output_path = source_path.with_name(output_name)
@@ -792,6 +822,9 @@ async def run_px4_keyboard_control(
     command_duration_sec: float,
     acceleration_limit_mps2: float,
     yaw_acceleration_dps2: float,
+    speed_step_mps: float,
+    min_speed_mps: float,
+    _max_speed_mps: float,
     live_ned: LiveNedDisplay,
     flight_trace: FlightTrace = None,
 ):
@@ -800,6 +833,11 @@ async def run_px4_keyboard_control(
     command_duration_sec = max(0.05, command_duration_sec)
     max_velocity_delta = max(0.0, acceleration_limit_mps2) * command_duration_sec
     max_yaw_delta = max(0.0, yaw_acceleration_dps2) * command_duration_sec
+    speed_step_mps = max(0.1, speed_step_mps)
+    min_speed_mps = max(0.0, min_speed_mps)
+    current_speed_mps = max(velocity_mps, min_speed_mps)
+    last_speed_adjust_time = 0.0
+    speed_adjust_debounce_sec = 0.25
     commanded_velocity = [0.0, 0.0, 0.0]
     commanded_yaw_rate = 0.0
 
@@ -808,8 +846,11 @@ async def run_px4_keyboard_control(
     print("A/D: left/right")
     print("Up/Down Arrows: up/down altitude")
     print("Left/Right Arrows: yaw left/right")
-    print("L: land and exit")
+    print("K/L: increase/decrease speed")
+    print("X: land and exit")
     print("Q: quit without landing")
+    print(f"Speed: {current_speed_mps:.1f} m/s")
+    print("Speed cap: unbounded")
     print("----------------------------")
 
     while True:
@@ -821,28 +862,42 @@ async def run_px4_keyboard_control(
 
         target_velocity = [0.0, 0.0, 0.0]
         target_yaw_rate = 0.0
+        now = time.time()
+
+        if keyboard_module.is_pressed("k") and (
+            now - last_speed_adjust_time >= speed_adjust_debounce_sec
+        ):
+            current_speed_mps += speed_step_mps
+            projectairsim_log().info("Keyboard speed: %.1f m/s", current_speed_mps)
+            last_speed_adjust_time = now
+        elif keyboard_module.is_pressed("l") and (
+            now - last_speed_adjust_time >= speed_adjust_debounce_sec
+        ):
+            current_speed_mps = max(min_speed_mps, current_speed_mps - speed_step_mps)
+            projectairsim_log().info("Keyboard speed: %.1f m/s", current_speed_mps)
+            last_speed_adjust_time = now
 
         if keyboard_module.is_pressed("w"):
-            target_velocity[0] = velocity_mps
+            target_velocity[0] = current_speed_mps
         elif keyboard_module.is_pressed("s"):
-            target_velocity[0] = -velocity_mps
+            target_velocity[0] = -current_speed_mps
 
         if keyboard_module.is_pressed("a"):
-            target_velocity[1] = -velocity_mps
+            target_velocity[1] = -current_speed_mps
         elif keyboard_module.is_pressed("d"):
-            target_velocity[1] = velocity_mps
+            target_velocity[1] = current_speed_mps
 
         if keyboard_module.is_pressed("up"):
-            target_velocity[2] = -velocity_mps
+            target_velocity[2] = -current_speed_mps
         elif keyboard_module.is_pressed("down"):
-            target_velocity[2] = velocity_mps
+            target_velocity[2] = current_speed_mps
 
         if keyboard_module.is_pressed("left"):
             target_yaw_rate = -yaw_rate_dps
         elif keyboard_module.is_pressed("right"):
             target_yaw_rate = yaw_rate_dps
 
-        if keyboard_module.is_pressed("l"):
+        if keyboard_module.is_pressed("x"):
             projectairsim_log().info("Keyboard requested landing")
             land_task = await drone.land_async()
             await await_drone_task(
@@ -890,6 +945,107 @@ async def run_px4_keyboard_control(
         await asyncio.sleep(0.02)
 
 
+async def run_direct_keyboard_control(
+    drone: Drone,
+    velocity_mps: float,
+    yaw_rate_dps: float,
+    speed_step_mps: float,
+    min_speed_mps: float,
+    live_ned: LiveNedDisplay,
+    flight_trace: FlightTrace = None,
+):
+    keyboard_module = load_keyboard_module()
+    speed_step_mps = max(0.1, speed_step_mps)
+    min_speed_mps = max(0.0, min_speed_mps)
+    current_speed_mps = max(velocity_mps, min_speed_mps)
+    speed_adjust_debounce_sec = 0.25
+    last_speed_adjust_time = 0.0
+    last_status_time = 0.0
+    position = get_pose_position_ned(drone)
+    yaw_rad = get_pose_yaw_ned(drone)
+    last_tick_time = time.time()
+
+    print("\n--- Direct Keyboard Control ---")
+    print("W/S: forward/backward")
+    print("A/D: left/right")
+    print("Up/Down Arrows: up/down altitude")
+    print("Left/Right Arrows: yaw left/right")
+    print("K/L: increase/decrease speed")
+    print("X/Q: exit")
+    print(f"Speed: {current_speed_mps:.1f} m/s")
+    print("Speed cap: unbounded")
+    print("-------------------------------")
+
+    while True:
+        now = time.time()
+        dt = min(max(now - last_tick_time, 0.0), 0.1)
+        last_tick_time = now
+
+        if keyboard_module.is_pressed("k") and (
+            now - last_speed_adjust_time >= speed_adjust_debounce_sec
+        ):
+            current_speed_mps += speed_step_mps
+            projectairsim_log().info("Keyboard speed: %.1f m/s", current_speed_mps)
+            last_speed_adjust_time = now
+        elif keyboard_module.is_pressed("l") and (
+            now - last_speed_adjust_time >= speed_adjust_debounce_sec
+        ):
+            current_speed_mps = max(min_speed_mps, current_speed_mps - speed_step_mps)
+            projectairsim_log().info("Keyboard speed: %.1f m/s", current_speed_mps)
+            last_speed_adjust_time = now
+
+        if keyboard_module.is_pressed("q") or keyboard_module.is_pressed("x"):
+            projectairsim_log().info("Direct keyboard requested exit")
+            return
+
+        if keyboard_module.is_pressed("left"):
+            yaw_rad -= math.radians(yaw_rate_dps) * dt
+        elif keyboard_module.is_pressed("right"):
+            yaw_rad += math.radians(yaw_rate_dps) * dt
+
+        body_velocity = [0.0, 0.0, 0.0]
+        if keyboard_module.is_pressed("w"):
+            body_velocity[0] = current_speed_mps
+        elif keyboard_module.is_pressed("s"):
+            body_velocity[0] = -current_speed_mps
+
+        if keyboard_module.is_pressed("a"):
+            body_velocity[1] = -current_speed_mps
+        elif keyboard_module.is_pressed("d"):
+            body_velocity[1] = current_speed_mps
+
+        if keyboard_module.is_pressed("up"):
+            body_velocity[2] = -current_speed_mps
+        elif keyboard_module.is_pressed("down"):
+            body_velocity[2] = current_speed_mps
+
+        world_velocity = [
+            body_velocity[0] * math.cos(yaw_rad) - body_velocity[1] * math.sin(yaw_rad),
+            body_velocity[0] * math.sin(yaw_rad) + body_velocity[1] * math.cos(yaw_rad),
+            body_velocity[2],
+        ]
+        if vector_magnitude(world_velocity) > 0.0 or abs(body_velocity[2]) > 0.0:
+            position = [
+                position[idx] + world_velocity[idx] * dt
+                for idx in range(3)
+            ]
+            drone.set_pose(make_pose_ned_yaw(position, yaw_rad), reset_kinematics=True)
+
+        if flight_trace:
+            flight_trace.record("Direct keyboard control", position)
+        if live_ned:
+            live_ned.show("Direct keyboard control", position)
+        if now - last_status_time >= 1.0:
+            projectairsim_log().info(
+                "Direct speed requested=%.1f actual=%.1f m/s",
+                current_speed_mps,
+                vector_magnitude(world_velocity),
+            )
+            last_status_time = now
+
+        await asyncio.sleep(0.02)
+
+
 async def run_autopilot(args):
     scene = args.scene
     sim_config_path = args.sim_config_path
@@ -905,13 +1061,15 @@ async def run_autopilot(args):
             args.sim_config_path,
             args.drone_name,
             args.start,
+            args.start_yaw_deg,
         )
         start_as_scene_origin = True
         projectairsim_log().info(
-            "Generated PX4 start scene %s with %s origin xyz=%s",
+            "Generated PX4 start scene %s with %s origin xyz=%s rpy-deg=%s",
             generated_scene_path,
             args.drone_name,
             format_scene_origin_xyz(args.start),
+            format_scene_origin_rpy(args.start_yaw_deg),
         )
 
     client = ProjectAirSimClient(
@@ -991,6 +1149,28 @@ async def run_autopilot(args):
             )
 
         if args.keyboard_control:
+            if args.keyboard_flight_mode == "direct":
+                if runtime_teleport_start:
+                    if not start:
+                        raise RuntimeError("--teleport-start requires --start in keyboard mode")
+                    await teleport_and_verify(
+                        drone,
+                        start,
+                        args.after_teleport_delay_sec,
+                        live_ned,
+                        flight_trace,
+                    )
+                await run_direct_keyboard_control(
+                    drone,
+                    args.keyboard_speed_mps,
+                    args.keyboard_yaw_rate_dps,
+                    args.keyboard_speed_step_mps,
+                    args.keyboard_min_speed_mps,
+                    live_ned,
+                    flight_trace,
+                )
+                return
+
             await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
 
             if runtime_teleport_start:
@@ -1048,6 +1228,9 @@ async def run_autopilot(args):
                 args.keyboard_command_duration_sec,
                 args.keyboard_acceleration_limit_mps2,
                 args.keyboard_yaw_acceleration_dps2,
+                args.keyboard_speed_step_mps,
+                args.keyboard_min_speed_mps,
+                args.keyboard_max_speed_mps,
                 live_ned,
                 flight_trace,
             )
@@ -1323,10 +1506,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use PX4 keyboard/manual control mode instead of A* planning.",
     )
     parser.add_argument(
+        "--keyboard-flight-mode",
+        choices=["px4", "direct"],
+        default="px4",
+        help=(
+            "Use PX4 offboard velocity commands, or direct kinematic actor "
+            "movement for fast environment inspection."
+        ),
+    )
+    parser.add_argument(
         "--keyboard-speed-mps",
         type=float,
         default=4.0,
         help="Body-frame speed used by --keyboard-control.",
+    )
+    parser.add_argument(
+        "--keyboard-speed-step-mps",
+        type=float,
+        default=1.0,
+        help="Speed increment/decrement for K/L in --keyboard-control.",
+    )
+    parser.add_argument(
+        "--keyboard-min-speed-mps",
+        type=float,
+        default=0.5,
+        help="Minimum adjustable keyboard speed.",
+    )
+    parser.add_argument(
+        "--keyboard-max-speed-mps",
+        type=float,
+        default=0.0,
+        help="Deprecated; keyboard speed is unbounded.",
     )
     parser.add_argument(
         "--keyboard-yaw-rate-dps",
@@ -1359,6 +1569,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Generate and load a runtime scene config with the drone actor "
             "origin set to --start. This is the preferred PX4 start workflow; "
             "it avoids runtime set_pose teleporting after PX4 connects."
+        ),
+    )
+    parser.add_argument(
+        "--start-yaw-deg",
+        type=float,
+        default=-90.0,
+        help=(
+            "Yaw written into the generated scene origin when "
+            "--start-as-scene-origin is used. -90 faces 90 degrees left "
+            "from the default spawn heading."
         ),
     )
     parser.add_argument("--resolution-m", type=float, default=1.0)
