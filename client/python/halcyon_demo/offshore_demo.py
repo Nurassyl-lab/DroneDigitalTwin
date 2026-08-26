@@ -3,10 +3,11 @@ Offshore wind farm PX4 demo.
 
 Run this while the OffShoreWindFarm Unreal map is playing. The script loads a
 PX4 scene, spawns Drone1 at OFFSHORE_ROUTE[0], and shows FPV with a
-chase-camera picture-in-picture. For now there is no route flying; E/R teleport
-between the route points.
+chase-camera picture-in-picture. E/R teleport between the route points. Space
+teleports to Origin and starts PX4 auto flight along the route.
 
 Controls in the OpenCV preview:
+  space  teleport to Origin and start PX4 auto flight
   e  teleport to next route point
   r  teleport to previous route point
   t  enter custom teleport as x,y,z,angle
@@ -15,6 +16,7 @@ Controls in the OpenCV preview:
 
 import argparse
 import asyncio
+from contextlib import suppress
 import math
 import queue
 import shutil
@@ -39,17 +41,20 @@ if str(EXAMPLE_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLE_SCRIPTS_DIR))
 
 from px4_astar_autopilot import (  # noqa: E402
+    arm_with_retry,
     distance_between,
+    fly_to_point_by_velocity,
     format_vector3,
     get_pose_position_ned,
     get_pose_yaw_ned,
     heading_deg_360,
+    request_px4_control,
     wait_for_px4_ready,
 )
 
 
 OFFSHORE_ROUTE = [
-    ("Origin", [0.0, 148.0, -2.0], 90.0),
+    ("Origin", [0.0, 148.0, -2.0], 270.0),
     ("Waypoint 1", [1.28, -14.66, -115.16], 127.6),
     ("Waypoint 2", [893.69, 7.89, -112.77], 324.3),
     ("Waypoint 3", [899.44, -892.28, -12.28], 279.5),
@@ -198,9 +203,13 @@ class DemoState:
         self.last_requested_position = list(self.route[0].position)
         self.last_requested_yaw_deg = self.route[0].yaw_deg
         self.diagnostics = {}
+        self.mode = "teleport"
+        self.mode_detail = "space starts auto flight"
+        self.auto_flight_running = False
         self.camera_epoch = 0
         self.teleport_requests = queue.SimpleQueue()
         self.manual_teleport_requests = queue.SimpleQueue()
+        self.auto_flight_requests = queue.SimpleQueue()
         self.stop_requested = False
         self.lock = Lock()
 
@@ -215,6 +224,9 @@ class DemoState:
                 "last_requested_position": list(self.last_requested_position),
                 "last_requested_yaw_deg": self.last_requested_yaw_deg,
                 "diagnostics": dict(self.diagnostics),
+                "mode": self.mode,
+                "mode_detail": self.mode_detail,
+                "auto_flight_running": self.auto_flight_running,
                 "camera_epoch": self.camera_epoch,
                 "stop_requested": self.stop_requested,
             }
@@ -258,6 +270,15 @@ class DemoState:
                 "time": time.time(),
             }
 
+    def set_mode(self, mode: str, detail: str = ""):
+        with self.lock:
+            self.mode = mode
+            self.mode_detail = detail
+
+    def set_auto_flight_running(self, running: bool):
+        with self.lock:
+            self.auto_flight_running = bool(running)
+
     def update_image_diagnostic(self, name: str, image):
         position = image_pose_position(image)
         yaw_deg = image_pose_yaw_deg(image)
@@ -288,6 +309,9 @@ class DemoState:
 
     def queue_manual_teleport(self):
         self.manual_teleport_requests.put(True)
+
+    def queue_auto_flight(self):
+        self.auto_flight_requests.put(True)
 
     def request_stop(self):
         with self.lock:
@@ -490,7 +514,10 @@ class OffshorePreview:
         if key < 0:
             return
         key &= 0xFF
-        if key == ord("e"):
+        if key == 32:
+            if self.accept_key("space"):
+                self.state.queue_auto_flight()
+        elif key == ord("e"):
             if self.accept_key("e"):
                 self.state.queue_teleport(1)
         elif key == ord("r"):
@@ -602,8 +629,8 @@ class OffshorePreview:
         lines = [
             f"Target: {target.label}  {distance:.1f} m",
             f"NED: x={position[0]:.1f} y={position[1]:.1f} z={position[2]:.1f}",
-            f"Heading: {snapshot['heading_deg']:.1f} deg  Mode: auto diagnostic",
-            "automatic route | q/esc quit",
+            f"Heading: {snapshot['heading_deg']:.1f} deg  Mode: {snapshot['mode']}",
+            f"{snapshot['mode_detail']} | e/r teleport | t custom | q/esc quit",
         ]
         y = frame.shape[0] - 92
         for line in lines:
@@ -1143,6 +1170,14 @@ def drain_manual_teleport_request(state: DemoState) -> bool:
     return requested
 
 
+def drain_auto_flight_request(state: DemoState) -> bool:
+    requested = False
+    while not state.auto_flight_requests.empty():
+        state.auto_flight_requests.get()
+        requested = True
+    return requested
+
+
 def parse_manual_teleport(value: str) -> RoutePoint:
     cleaned = value.strip().strip("[]()")
     parts = cleaned.replace(",", " ").split()
@@ -1269,6 +1304,102 @@ async def settle_and_sample(
     update_drone_diagnostics(drone, state, world, object_name)
 
 
+async def run_route_auto_flight(
+    drone: Drone,
+    state: DemoState,
+    args,
+    world: Optional[World] = None,
+):
+    if state.snapshot()["auto_flight_running"]:
+        projectairsim_log().info("Auto flight is already running")
+        return
+
+    state.set_auto_flight_running(True)
+    state.set_mode("auto flight", f"speed {args.route_speed_mps:.1f} m/s")
+    try:
+        projectairsim_log().info(
+            "Auto flight requested: teleporting to Origin, then flying %d route points at %.1f m/s",
+            len(state.route),
+            args.route_speed_mps,
+        )
+        await apply_teleport(drone, state, 0, args, world)
+        await settle_and_sample(
+            drone,
+            state,
+            args.post_teleport_flight_delay_sec,
+            world,
+            args.drone_name,
+        )
+
+        if not drone.enable_api_control():
+            raise RuntimeError("Project AirSim rejected EnableApiControl for PX4 auto flight")
+        await arm_with_retry(drone, args.arm_timeout_sec)
+        await request_px4_control(drone)
+
+        commanded_velocity = [0.0, 0.0, 0.0]
+        for index, point in enumerate(state.route[1:], start=1):
+            if state.snapshot()["stop_requested"]:
+                break
+
+            target_ned = route_to_ned(point.position)
+            current_ned = get_pose_position_ned(drone)
+            leg_distance_m = distance_between(current_ned, target_ned)
+            timeout_sec = args.route_move_timeout_sec
+            if timeout_sec <= 0.0:
+                timeout_sec = (
+                    leg_distance_m
+                    / max(args.route_speed_mps, 0.1)
+                    * args.route_timeout_multiplier
+                )
+
+            with state.lock:
+                state.target_index = index
+
+            projectairsim_log().info(
+                "Auto flight leg %d/%d to %s NED %s distance %.1fm speed %.1fm/s timeout %.1fs",
+                index,
+                len(state.route) - 1,
+                point.label,
+                format_vector3(target_ned),
+                leg_distance_m,
+                args.route_speed_mps,
+                timeout_sec,
+            )
+            commanded_velocity = await fly_to_point_by_velocity(
+                drone,
+                target_ned,
+                args.route_speed_mps,
+                args.route_acceptance_m,
+                timeout_sec,
+                args.pose_report_interval_sec,
+                args.face_travel_direction,
+                point.label,
+                args.velocity_command_duration_sec,
+                args.velocity_acceleration_limit_mps2,
+                args.slowdown_distance_m,
+                args.path_yaw_rate_dps,
+                commanded_velocity,
+                index == len(state.route) - 1,
+                False,
+            )
+            current_ned = get_pose_position_ned(drone)
+            state.update_pose(ned_to_route(current_ned), heading_deg_360(get_pose_yaw_ned(drone)))
+            state.mark_reached(index)
+            update_drone_diagnostics(drone, state, world, args.drone_name)
+
+        projectairsim_log().info("Auto flight complete")
+    except asyncio.CancelledError:
+        projectairsim_log().info("Auto flight cancelled")
+        drone.cancel_last_task()
+        raise
+    except Exception as exc:
+        projectairsim_log().warning("Auto flight failed: %s", exc)
+    finally:
+        state.set_auto_flight_running(False)
+        if not state.snapshot()["stop_requested"]:
+            state.set_mode("teleport", "space starts auto flight")
+
+
 async def run_auto_diagnostic_mission(
     drone: Drone,
     state: DemoState,
@@ -1313,52 +1444,82 @@ async def run_teleport_viewer(
     state.set_route_index(initial_index)
     state.update_pose(initial_route, heading_deg_360(get_pose_yaw_ned(drone)))
     update_drone_diagnostics(drone, state, world, args.drone_name)
-    projectairsim_log().info("Teleport-only mode active. Press e/r/t in the preview.")
+    projectairsim_log().info(
+        "Interactive mode active. Press space for auto flight, or e/r/t for teleport controls."
+    )
     last_report_at = 0.0
     last_diagnostics_at = 0.0
+    auto_flight_task = None
 
-    while not state.snapshot()["stop_requested"]:
-        current_ned = get_pose_position_ned(drone)
-        current = ned_to_route(current_ned)
-        current_heading = heading_deg_360(get_pose_yaw_ned(drone))
-        state.update_pose(current, current_heading)
-        state.set_route_index(nearest_route_index(state.route, current))
-
-        now = time.time()
-        if now - last_diagnostics_at >= 0.5:
-            update_drone_diagnostics(drone, state, world, args.drone_name)
-            last_diagnostics_at = now
-
-        direction = drain_teleport_request(state)
-        if direction is not None:
-            base_index = nearest_route_index(state.route, current)
-            target_index = (base_index + direction) % len(state.route)
-            projectairsim_log().info(
-                "Route key %s from nearest %s index=%d to %s index=%d",
-                "next" if direction > 0 else "previous",
-                state.route[base_index].label,
-                base_index,
-                state.route[target_index].label,
-                target_index,
-            )
-            await apply_teleport(drone, state, target_index, args, world)
+    try:
+        while not state.snapshot()["stop_requested"]:
             current_ned = get_pose_position_ned(drone)
             current = ned_to_route(current_ned)
             current_heading = heading_deg_360(get_pose_yaw_ned(drone))
             state.update_pose(current, current_heading)
-        if drain_manual_teleport_request(state):
-            await prompt_manual_teleport(drone, state, args, world)
+            if not state.snapshot()["auto_flight_running"]:
+                state.set_route_index(nearest_route_index(state.route, current))
 
-        if now - last_report_at >= args.pose_report_interval_sec:
-            projectairsim_log().info(
-                "Teleport viewer NED %s heading %.1f deg",
-                format_vector3(current),
-                current_heading,
-            )
-            log_diagnostics(state.snapshot())
-            last_report_at = now
+            now = time.time()
+            if now - last_diagnostics_at >= 0.5:
+                update_drone_diagnostics(drone, state, world, args.drone_name)
+                last_diagnostics_at = now
 
-        await asyncio.sleep(0.05)
+            if auto_flight_task is not None and auto_flight_task.done():
+                await auto_flight_task
+                auto_flight_task = None
+
+            if drain_auto_flight_request(state):
+                if auto_flight_task is None:
+                    auto_flight_task = asyncio.create_task(
+                        run_route_auto_flight(drone, state, args, world)
+                    )
+                else:
+                    projectairsim_log().info("Auto flight is already running")
+
+            direction = drain_teleport_request(state)
+            if direction is not None:
+                if state.snapshot()["auto_flight_running"]:
+                    projectairsim_log().info("Ignoring teleport key while auto flight is running")
+                else:
+                    base_index = nearest_route_index(state.route, current)
+                    target_index = (base_index + direction) % len(state.route)
+                    projectairsim_log().info(
+                        "Route key %s from nearest %s index=%d to %s index=%d",
+                        "next" if direction > 0 else "previous",
+                        state.route[base_index].label,
+                        base_index,
+                        state.route[target_index].label,
+                        target_index,
+                    )
+                    await apply_teleport(drone, state, target_index, args, world)
+                    current_ned = get_pose_position_ned(drone)
+                    current = ned_to_route(current_ned)
+                    current_heading = heading_deg_360(get_pose_yaw_ned(drone))
+                    state.update_pose(current, current_heading)
+            if drain_manual_teleport_request(state):
+                if state.snapshot()["auto_flight_running"]:
+                    projectairsim_log().info("Ignoring custom teleport while auto flight is running")
+                else:
+                    await prompt_manual_teleport(drone, state, args, world)
+
+            if now - last_report_at >= args.pose_report_interval_sec:
+                projectairsim_log().info(
+                    "Viewer NED %s heading %.1f deg mode=%s",
+                    format_vector3(current),
+                    current_heading,
+                    state.snapshot()["mode"],
+                )
+                log_diagnostics(state.snapshot())
+                last_report_at = now
+
+            await asyncio.sleep(0.05)
+    finally:
+        if auto_flight_task is not None and not auto_flight_task.done():
+            drone.cancel_last_task()
+            auto_flight_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await auto_flight_task
 
 
 async def run_demo(args):
@@ -1419,7 +1580,7 @@ async def run_demo(args):
             lambda _, pose_msg: update_pose_topic_diagnostic(state, pose_msg),
         )
         projectairsim_log().info(
-            "Preview opened. Automatic diagnostic mission will run; q/esc quits."
+            "Preview opened. Press space for auto flight, e/r/t for teleport controls, q/esc quits."
         )
 
         await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
@@ -1431,7 +1592,12 @@ async def run_demo(args):
             format_vector3(initial_pose_route),
         )
 
-        await run_auto_diagnostic_mission(drone, state, args, world)
+        if args.auto_diagnostic:
+            state.set_mode("auto diagnostic", "automatic teleport snapshots")
+            await run_auto_diagnostic_mission(drone, state, args, world)
+        else:
+            state.set_mode("teleport", "space starts auto flight")
+            await run_teleport_viewer(drone, state, args, world)
     finally:
         state.request_stop()
         preview.stop()
@@ -1463,6 +1629,11 @@ def build_parser():
     parser.add_argument("--services-port", type=int, default=8990)
     parser.add_argument("--load-delay-sec", type=float, default=2.0)
     parser.add_argument(
+        "--auto-diagnostic",
+        action="store_true",
+        help="Run the old automatic teleport diagnostic route instead of interactive mode.",
+    )
+    parser.add_argument(
         "--auto-wait-sec",
         type=float,
         default=5.0,
@@ -1474,6 +1645,80 @@ def build_parser():
         help="Keep the preview open after the automatic diagnostic route completes.",
     )
     parser.add_argument("--px4-ready-timeout-sec", type=float, default=300.0)
+    parser.add_argument("--arm-timeout-sec", type=float, default=60.0)
+    parser.add_argument(
+        "--route-speed-mps",
+        type=float,
+        default=12.0,
+        help="PX4 auto-flight speed used after pressing space.",
+    )
+    parser.add_argument(
+        "--route-acceptance-m",
+        type=float,
+        default=5.0,
+        help="Distance from a waypoint that counts as reached during auto flight.",
+    )
+    parser.add_argument(
+        "--route-move-timeout-sec",
+        type=float,
+        default=0.0,
+        help="Per-leg timeout. Use 0 to infer from leg distance and speed.",
+    )
+    parser.add_argument(
+        "--route-timeout-multiplier",
+        type=float,
+        default=3.0,
+        help="Multiplier for inferred per-leg timeout when route move timeout is 0.",
+    )
+    parser.add_argument(
+        "--post-teleport-flight-delay-sec",
+        type=float,
+        default=1.0,
+        help="Seconds to wait after teleporting to Origin before starting PX4 flight.",
+    )
+    parser.add_argument(
+        "--pose-report-interval-sec",
+        type=float,
+        default=1.0,
+        help="Seconds between terminal pose/flight progress reports.",
+    )
+    parser.add_argument(
+        "--velocity-command-duration-sec",
+        type=float,
+        default=0.2,
+        help="Duration of each PX4 velocity setpoint during auto flight.",
+    )
+    parser.add_argument(
+        "--velocity-acceleration-limit-mps2",
+        type=float,
+        default=4.0,
+        help="Maximum velocity change rate during auto flight.",
+    )
+    parser.add_argument(
+        "--slowdown-distance-m",
+        type=float,
+        default=20.0,
+        help="Distance over which auto flight eases down near each waypoint.",
+    )
+    parser.add_argument(
+        "--path-yaw-rate-dps",
+        type=float,
+        default=90.0,
+        help="Maximum yaw rate when facing travel direction during auto flight.",
+    )
+    parser.add_argument(
+        "--face-travel-direction",
+        dest="face_travel_direction",
+        action="store_true",
+        default=True,
+        help="Yaw toward the current travel direction during auto flight.",
+    )
+    parser.add_argument(
+        "--no-face-travel-direction",
+        dest="face_travel_direction",
+        action="store_false",
+        help="Keep PX4 yaw control from turning toward the travel direction.",
+    )
     parser.add_argument("--fpv-camera", default="FrontCamera")
     parser.add_argument("--chase-camera", default="Chase")
     parser.add_argument("--camera-width", type=int, default=1280)
