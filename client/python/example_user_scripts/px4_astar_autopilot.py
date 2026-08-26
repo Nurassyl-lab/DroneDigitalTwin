@@ -39,7 +39,13 @@ def parse_vector3(value: str) -> List[float]:
 
 def normalize_vector_args(argv: Sequence[str]) -> List[str]:
     normalized = []
-    vector_options = {"--start", "--goal", "--map-center", "--map-size"}
+    vector_options = {
+        "--start",
+        "--goal",
+        "--map-center",
+        "--map-size",
+        "--wind-vector",
+    }
     idx = 0
     while idx < len(argv):
         arg = argv[idx]
@@ -56,6 +62,34 @@ def parse_size3(value: str) -> List[int]:
     if any(component <= 0 for component in size):
         raise argparse.ArgumentTypeError("Map size values must be positive")
     return [int(math.ceil(component)) for component in size]
+
+
+def wind_vector_from_speed_direction(
+    speed_mps: float,
+    direction_deg: float,
+    down_mps: float = 0.0,
+) -> List[float]:
+    direction_rad = math.radians(direction_deg)
+    return [
+        speed_mps * math.cos(direction_rad),
+        speed_mps * math.sin(direction_rad),
+        down_mps,
+    ]
+
+
+def wind_speed_direction_from_vector(wind_ned: Sequence[float]) -> Tuple[float, float]:
+    speed = math.hypot(wind_ned[0], wind_ned[1])
+    direction = math.degrees(math.atan2(wind_ned[1], wind_ned[0])) % 360.0
+    return speed, direction
+
+
+def format_wind(wind_ned: Sequence[float]) -> str:
+    speed, direction = wind_speed_direction_from_vector(wind_ned)
+    return (
+        f"NED {format_vector3(wind_ned)} "
+        f"(horizontal {speed:.1f} m/s toward {direction:.1f} deg, "
+        f"down {wind_ned[2]:.1f} m/s)"
+    )
 
 
 def make_pose_ned(position_ned: Sequence[float]) -> Pose:
@@ -284,6 +318,29 @@ def parse_teleport_input(value: str) -> Tuple[List[float], float]:
     return numbers[:3], yaw_rad
 
 
+def parse_wind_input(value: str) -> List[float]:
+    parts = value.replace(",", " ").split()
+    if len(parts) not in (2, 3):
+        raise ValueError("expected speed_mps,heading_deg[,down_mps]")
+
+    speed_mps = float(parts[0])
+    direction_deg = float(parts[1])
+    down_mps = float(parts[2]) if len(parts) == 3 else 0.0
+    return wind_vector_from_speed_direction(speed_mps, direction_deg, down_mps)
+
+
+def resolve_wind_vector(args) -> List[float]:
+    if args.wind_vector is not None:
+        return [float(component) for component in args.wind_vector]
+    if args.wind_speed_mps is not None:
+        return wind_vector_from_speed_direction(
+            args.wind_speed_mps,
+            args.wind_direction_deg,
+            args.wind_down_mps,
+        )
+    return None
+
+
 async def prompt_keyboard_teleport(
     drone: Drone,
     current_yaw_rad: float,
@@ -314,6 +371,21 @@ async def prompt_keyboard_teleport(
         heading_deg_360(yaw_rad),
     )
     return actual, yaw_rad
+
+
+async def prompt_keyboard_wind(world) -> List[float]:
+    prompt = "\nWind speed_mps,heading_deg[,down_mps] (blank/cancel to skip): "
+    value = (await asyncio.to_thread(input, prompt)).strip()
+    if not value or value.lower() in {"c", "cancel", "q", "quit"}:
+        wind = list(world.get_wind_velocity())
+        projectairsim_log().info("Wind unchanged: %s", format_wind(wind))
+        return wind
+
+    wind = parse_wind_input(value)
+    world.set_wind_velocity(wind[0], wind[1], wind[2])
+    confirmed = list(world.get_wind_velocity())
+    projectairsim_log().info("Wind set: %s", format_wind(confirmed))
+    return confirmed
 
 
 async def teleport_and_verify(
@@ -872,6 +944,7 @@ async def fly_path_by_velocity(
 
 
 async def run_px4_keyboard_control(
+    world: World,
     drone: Drone,
     velocity_mps: float,
     yaw_rate_dps: float,
@@ -894,9 +967,11 @@ async def run_px4_keyboard_control(
     current_speed_mps = max(velocity_mps, min_speed_mps)
     last_speed_adjust_time = 0.0
     last_teleport_time = 0.0
+    last_wind_time = 0.0
     last_status_time = 0.0
     speed_adjust_debounce_sec = 0.25
     teleport_debounce_sec = 0.5
+    wind_debounce_sec = 0.5
     commanded_velocity = [0.0, 0.0, 0.0]
     commanded_yaw_rate = 0.0
 
@@ -907,6 +982,7 @@ async def run_px4_keyboard_control(
     print("Left/Right Arrows: yaw left/right")
     print("K/L: increase/decrease speed")
     print("T: teleport to NED x,y,z[,yaw_deg]")
+    print("G: set wind speed_mps,heading_deg[,down_mps]")
     print("X: land and exit")
     print("Q: quit without landing")
     print(f"Speed: {current_speed_mps:.1f} m/s")
@@ -952,6 +1028,16 @@ async def run_px4_keyboard_control(
             except ValueError as exc:
                 projectairsim_log().info("Teleport ignored: %s", exc)
             last_teleport_time = time.time()
+            continue
+
+        if keyboard_module.is_pressed("g") and (
+            now - last_wind_time >= wind_debounce_sec
+        ):
+            try:
+                await prompt_keyboard_wind(world)
+            except ValueError as exc:
+                projectairsim_log().info("Wind ignored: %s", exc)
+            last_wind_time = time.time()
             continue
 
         if keyboard_module.is_pressed("w"):
@@ -1034,6 +1120,7 @@ async def run_px4_keyboard_control(
 
 
 async def run_direct_keyboard_control(
+    world: World,
     drone: Drone,
     velocity_mps: float,
     yaw_rate_dps: float,
@@ -1048,8 +1135,10 @@ async def run_direct_keyboard_control(
     current_speed_mps = max(velocity_mps, min_speed_mps)
     speed_adjust_debounce_sec = 0.25
     teleport_debounce_sec = 0.5
+    wind_debounce_sec = 0.5
     last_speed_adjust_time = 0.0
     last_teleport_time = 0.0
+    last_wind_time = 0.0
     last_status_time = 0.0
     position = get_pose_position_ned(drone)
     yaw_rad = get_pose_yaw_ned(drone)
@@ -1062,6 +1151,7 @@ async def run_direct_keyboard_control(
     print("Left/Right Arrows: yaw left/right")
     print("K/L: increase/decrease speed")
     print("T: teleport to NED x,y,z[,yaw_deg]")
+    print("G: set wind speed_mps,heading_deg[,down_mps]")
     print("X/Q: exit")
     print(f"Speed: {current_speed_mps:.1f} m/s")
     print("Speed cap: unbounded")
@@ -1099,6 +1189,16 @@ async def run_direct_keyboard_control(
             except ValueError as exc:
                 projectairsim_log().info("Teleport ignored: %s", exc)
             last_teleport_time = time.time()
+            continue
+
+        if keyboard_module.is_pressed("g") and (
+            now - last_wind_time >= wind_debounce_sec
+        ):
+            try:
+                await prompt_keyboard_wind(world)
+            except ValueError as exc:
+                projectairsim_log().info("Wind ignored: %s", exc)
+            last_wind_time = time.time()
             continue
 
         if keyboard_module.is_pressed("q") or keyboard_module.is_pressed("x"):
@@ -1207,6 +1307,11 @@ async def run_autopilot(args):
             delay_after_load_sec=args.load_delay_sec,
             sim_config_path=sim_config_path,
         )
+        wind_vector = resolve_wind_vector(args)
+        if wind_vector is not None:
+            world.set_wind_velocity(wind_vector[0], wind_vector[1], wind_vector[2])
+            confirmed_wind = list(world.get_wind_velocity())
+            projectairsim_log().info("Wind set: %s", format_wind(confirmed_wind))
         if start_as_scene_origin:
             projectairsim_log().info(
                 "Loaded %s with %s spawned at --start. If PX4 was already "
@@ -1269,6 +1374,7 @@ async def run_autopilot(args):
                         flight_trace,
                     )
                 await run_direct_keyboard_control(
+                    world,
                     drone,
                     args.keyboard_speed_mps,
                     args.keyboard_yaw_rate_dps,
@@ -1330,6 +1436,7 @@ async def run_autopilot(args):
                 live_ned.show("Skipping takeoff", skipping_takeoff_pose, force=True)
 
             await run_px4_keyboard_control(
+                world,
                 drone,
                 args.keyboard_speed_mps,
                 args.keyboard_yaw_rate_dps,
@@ -1608,6 +1715,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--services-port", type=int, default=8990)
     parser.add_argument("--load-delay-sec", type=float, default=2.0)
     parser.add_argument("--velocity-mps", type=float, default=4.0)
+    parser.add_argument(
+        "--wind-vector",
+        type=parse_vector3,
+        help="Initial global wind velocity as NED x,y,z in m/s.",
+    )
+    parser.add_argument(
+        "--wind-speed-mps",
+        type=float,
+        help=(
+            "Initial horizontal wind speed in m/s. Combine with "
+            "--wind-direction-deg; direction is where wind blows toward."
+        ),
+    )
+    parser.add_argument(
+        "--wind-direction-deg",
+        type=float,
+        default=0.0,
+        help="Initial wind direction in NED degrees: 0 north/+x, 90 east/+y.",
+    )
+    parser.add_argument(
+        "--wind-down-mps",
+        type=float,
+        default=0.0,
+        help="Initial vertical wind component in m/s, positive down in NED.",
+    )
     parser.add_argument(
         "--keyboard-control",
         action="store_true",
