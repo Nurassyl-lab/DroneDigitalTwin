@@ -95,6 +95,7 @@ from route_replan_static import (  # noqa: E402
 #     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
 OFFSHORE_ROUTE = [
     ("Origin", [0.0, 148.0, -2.0], 270.0),
+    ("Mission Start", [0.0, 130.0, -2.0], 270.0),
     ("Around waypoint 1", [12.85,-11.4,-115], 127.6),
     ("Waypoint 1", [1.28, -14.66, -115.16], 127.6),
     ("Around waypoint 2", [881.6,17,-113], 324.3),
