@@ -405,3 +405,5 @@ unreal/RealPlace
 unreal/WalkingNPCs
 client/python/halcyon_demo/flight_dynamics
 unreal/OffShoreWindFarm/
+wind_data/
+get_wind.py
