@@ -114,6 +114,9 @@ OFFSHORE_ROUTE = [
 TELEPORT_WARN_ERROR_M = 5.0
 FPV_MAX_CAMERA_OFFSET_M = 8.0
 CHASE_MAX_CAMERA_OFFSET_M = 13.0
+BATTERY_START_LABEL = "Mission Start"
+BATTERY_SECONDS_PER_PERCENT = 0.4 * 60.0
+COVERAGE_UNFEASIBLE_HOLD_SEC = 2.0
 WARNED_UNAVAILABLE = set()
 
 
@@ -392,6 +395,10 @@ class DemoState:
         self.mode_detail = "manual teleport mode"
         self.auto_flight_running = False
         self.camera_epoch = 0
+        self.battery_started_at = None
+        self.battery_percent = 100.0
+        self.coverage_unfeasible = False
+        self.coverage_unfeasible_logged = False
         self.teleport_requests = queue.SimpleQueue()
         self.manual_teleport_requests = queue.SimpleQueue()
         self.stop_requested = False
@@ -399,6 +406,7 @@ class DemoState:
 
     def snapshot(self):
         with self.lock:
+            self.battery_percent = self._battery_percent_locked()
             return {
                 "current_index": self.current_index,
                 "target_index": self.target_index,
@@ -412,8 +420,49 @@ class DemoState:
                 "mode_detail": self.mode_detail,
                 "auto_flight_running": self.auto_flight_running,
                 "camera_epoch": self.camera_epoch,
+                "battery_active": self.battery_started_at is not None,
+                "battery_percent": self.battery_percent,
+                "coverage_unfeasible": self.coverage_unfeasible,
                 "stop_requested": self.stop_requested,
             }
+
+    def _battery_percent_locked(self, now: Optional[float] = None) -> float:
+        if self.battery_started_at is None:
+            return 100.0
+        now = time.time() if now is None else now
+        elapsed_sec = max(0.0, now - self.battery_started_at)
+        depleted_percent = int(elapsed_sec // BATTERY_SECONDS_PER_PERCENT)
+        return float(clamp(100.0 - depleted_percent, 0.0, 100.0))
+
+    def _start_battery_if_trigger_locked(self, index: int) -> bool:
+        if self.battery_started_at is not None or index < 0 or index >= len(self.route):
+            return False
+        if self.route[index].label.strip().casefold() != BATTERY_START_LABEL.casefold():
+            return False
+        self.battery_started_at = time.time()
+        self.battery_percent = 100.0
+        return True
+
+    def check_battery_depleted(self) -> bool:
+        with self.lock:
+            self.battery_percent = self._battery_percent_locked()
+            if (
+                self.battery_started_at is not None
+                and self.battery_percent <= 0.0
+                and not self.coverage_unfeasible
+            ):
+                self.coverage_unfeasible = True
+                self.mode = "Coverage Unfeasible"
+                self.mode_detail = "battery depleted"
+                return True
+            return False
+
+    def take_coverage_unfeasible_log_event(self) -> bool:
+        with self.lock:
+            if self.coverage_unfeasible and not self.coverage_unfeasible_logged:
+                self.coverage_unfeasible_logged = True
+                return True
+            return False
 
     def update_pose(self, position: Sequence[float], heading_deg: float):
         with self.lock:
@@ -482,6 +531,7 @@ class DemoState:
         with self.lock:
             self.current_index = index
             self.target_index = min(index + 1, len(self.route) - 1)
+            return self._start_battery_if_trigger_locked(index)
 
     def set_route_index(self, index: int):
         with self.lock:
@@ -723,6 +773,8 @@ class OffshorePreview:
                         self.draw_route_overlay(cv2, frame)
                         self.draw_status(cv2, frame)
                         self.draw_diagnostics(cv2, frame)
+                        self.draw_battery(cv2, frame)
+                        self.draw_coverage_unfeasible(cv2, frame)
                         if not created:
                             cv2.namedWindow(
                                 self.window_name,
@@ -748,6 +800,8 @@ class OffshorePreview:
                 self.draw_route_overlay(cv2, frame)
                 self.draw_status(cv2, frame)
                 self.draw_diagnostics(cv2, frame)
+                self.draw_battery(cv2, frame)
+                self.draw_coverage_unfeasible(cv2, frame)
 
                 if not created:
                     cv2.namedWindow(
@@ -892,6 +946,85 @@ class OffshorePreview:
             self.draw_text(cv2, frame, line, (18, y), scale=0.55)
             y += 22
 
+    def draw_battery(self, cv2, frame):
+        snapshot = self.state.snapshot()
+        percent = clamp(float(snapshot["battery_percent"]), 0.0, 100.0)
+        red = (0, 0, 255)
+        height, width = frame.shape[:2]
+        body_w = 126
+        body_h = 30
+        tip_w = 8
+        percent_w = 62
+        x = max(18, width - body_w - tip_w - percent_w - 28)
+        y = max(18, height - body_h - 20)
+
+        cv2.rectangle(frame, (x, y), (x + body_w, y + body_h), red, 2)
+        cv2.rectangle(
+            frame,
+            (x + body_w + 2, y + 8),
+            (x + body_w + tip_w, y + body_h - 8),
+            red,
+            -1,
+        )
+
+        fill_w = int((body_w - 8) * (percent / 100.0))
+        if fill_w > 0:
+            cv2.rectangle(
+                frame,
+                (x + 4, y + 4),
+                (x + 4 + fill_w, y + body_h - 4),
+                red,
+                -1,
+            )
+
+        self.draw_text(
+            cv2,
+            frame,
+            f"{percent:3.0f}%",
+            (x + body_w + tip_w + 12, y + 22),
+            scale=0.66,
+            color=red,
+        )
+
+    def draw_coverage_unfeasible(self, cv2, frame):
+        snapshot = self.state.snapshot()
+        if not snapshot["coverage_unfeasible"]:
+            return
+
+        text = "Coverage Unfeasible"
+        scale = 1.25
+        thickness = 2
+        red = (0, 0, 255)
+        height, width = frame.shape[:2]
+        (text_w, text_h), baseline = cv2.getTextSize(
+            text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            thickness,
+        )
+        x = max(18, (width - text_w) // 2)
+        y = max(text_h + 18, (height + text_h) // 2)
+        pad_x = 28
+        pad_y = 18
+
+        overlay = frame.copy()
+        cv2.rectangle(
+            overlay,
+            (x - pad_x, y - text_h - pad_y),
+            (x + text_w + pad_x, y + baseline + pad_y),
+            (18, 18, 18),
+            -1,
+        )
+        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0.0, frame)
+        cv2.rectangle(
+            frame,
+            (x - pad_x, y - text_h - pad_y),
+            (x + text_w + pad_x, y + baseline + pad_y),
+            red,
+            2,
+        )
+        self.draw_text(cv2, frame, text, (x, y), scale=scale, color=red)
+
     def draw_diagnostics(self, cv2, frame):
         snapshot = self.state.snapshot()
         diagnostics = snapshot["diagnostics"]
@@ -960,7 +1093,14 @@ class OffshorePreview:
             y += row_h
 
     @staticmethod
-    def draw_text(cv2, frame, text: str, origin: Tuple[int, int], scale: float = 0.6):
+    def draw_text(
+        cv2,
+        frame,
+        text: str,
+        origin: Tuple[int, int],
+        scale: float = 0.6,
+        color: Tuple[int, int, int] = (255, 255, 255),
+    ):
         cv2.putText(
             frame,
             text,
@@ -977,7 +1117,7 @@ class OffshorePreview:
             origin,
             cv2.FONT_HERSHEY_SIMPLEX,
             scale,
-            (255, 255, 255),
+            color,
             1,
             cv2.LINE_AA,
         )
@@ -1822,6 +1962,27 @@ def log_mission_snapshot(label: str, index: int, snapshot: Dict):
     log_diagnostics(snapshot)
 
 
+def log_battery_start_if_needed(started: bool):
+    if started:
+        projectairsim_log().info(
+            "Battery countdown started at %s: 100%%, depleting 1%% every %.1f seconds",
+            BATTERY_START_LABEL,
+            BATTERY_SECONDS_PER_PERCENT,
+        )
+
+
+def log_coverage_unfeasible_if_needed(state: DemoState):
+    if state.take_coverage_unfeasible_log_event():
+        projectairsim_log().warning(
+            "Coverage Unfeasible: battery reached 0%%. Stopping drone and simulation."
+        )
+
+
+async def hold_then_request_stop(state: DemoState):
+    await asyncio.sleep(COVERAGE_UNFEASIBLE_HOLD_SEC)
+    state.request_stop()
+
+
 def drain_manual_teleport_request(state: DemoState) -> bool:
     requested = False
     while not state.manual_teleport_requests.empty():
@@ -1875,9 +2036,8 @@ async def apply_teleport(
     actual_route = ned_to_route(actual_ned)
     state.update_pose(actual_route, point.yaw_deg)
     error_m = distance_between(actual_route, point.position)
-    with state.lock:
-        state.current_index = index
-        state.target_index = min(index + 1, len(state.route) - 1)
+    battery_started = state.mark_reached(index)
+    log_battery_start_if_needed(battery_started)
     projectairsim_log().info(
         "Teleported to %s index=%d NED requested=%s actual=%s error=%.2fm heading=%.1f deg",
         point.label,
@@ -1949,6 +2109,10 @@ async def settle_and_sample(
 ):
     settle_until = time.time() + max(0.0, duration_sec)
     while time.time() < settle_until and not state.snapshot()["stop_requested"]:
+        if state.check_battery_depleted() or state.snapshot()["coverage_unfeasible"]:
+            log_coverage_unfeasible_if_needed(state)
+            await hold_then_request_stop(state)
+            break
         current_ned = get_pose_position_ned(drone)
         current = ned_to_route(current_ned)
         current_heading = heading_deg_360(get_pose_yaw_ned(drone))
@@ -2005,6 +2169,17 @@ async def fly_route_segment_smooth(
         current = get_pose_position_ned(drone)
         distance = distance_between(current, target)
         state.update_pose(ned_to_route(current), heading_deg_360(get_pose_yaw_ned(drone)))
+        if state.check_battery_depleted() or state.snapshot()["coverage_unfeasible"]:
+            log_coverage_unfeasible_if_needed(state)
+            velocity = await brake_to_stop_by_velocity(
+                drone,
+                velocity,
+                command_duration_sec,
+                max_velocity_delta,
+            )
+            cancel_last_task_safely(drone)
+            await hold_then_request_stop(state)
+            return velocity
 
         if distance <= args.route_acceptance_m:
             if stop_at_target:
@@ -2220,6 +2395,9 @@ async def align_to_heading(
         current_yaw_rad = get_pose_yaw_ned(drone)
         yaw_error = wrap_angle_rad(target_yaw_rad - current_yaw_rad)
         state.update_pose(ned_to_route(current_ned), heading_deg_360(current_yaw_rad))
+        if state.check_battery_depleted() or state.snapshot()["coverage_unfeasible"]:
+            log_coverage_unfeasible_if_needed(state)
+            return
 
         if abs(yaw_error) <= yaw_acceptance_rad:
             projectairsim_log().info(
@@ -2391,6 +2569,8 @@ async def run_route_auto_flight(
                     args.path_yaw_deadband_deg,
                     args.travel_yaw_timeout_sec,
                 )
+                if state.snapshot()["stop_requested"] or state.snapshot()["coverage_unfeasible"]:
+                    break
             commanded_velocity = await fly_route_segment_smooth(
                 drone,
                 state,
@@ -2404,9 +2584,12 @@ async def run_route_auto_flight(
                 timeout_sec,
                 world,
             )
+            if state.snapshot()["stop_requested"] or state.snapshot()["coverage_unfeasible"]:
+                break
             current_ned = get_pose_position_ned(drone)
             state.update_pose(ned_to_route(current_ned), heading_deg_360(get_pose_yaw_ned(drone)))
-            state.mark_reached(index)
+            battery_started = state.mark_reached(index)
+            log_battery_start_if_needed(battery_started)
             update_drone_diagnostics(drone, state, world, args.drone_name)
             if named_waypoint:
                 await align_to_waypoint_yaw(
@@ -2417,10 +2600,20 @@ async def run_route_auto_flight(
                     point.label,
                     world,
                 )
+                if state.snapshot()["stop_requested"] or state.snapshot()["coverage_unfeasible"]:
+                    break
 
-        projectairsim_log().info("Auto flight complete")
-        state.set_mode("auto flight complete", "mission complete")
-        state.request_stop()
+        final_snapshot = state.snapshot()
+        if final_snapshot["coverage_unfeasible"]:
+            log_coverage_unfeasible_if_needed(state)
+            if not final_snapshot["stop_requested"]:
+                await hold_then_request_stop(state)
+        elif final_snapshot["stop_requested"]:
+            projectairsim_log().info("Auto flight stopped")
+        else:
+            projectairsim_log().info("Auto flight complete")
+            state.set_mode("auto flight complete", "mission complete")
+            state.request_stop()
     except asyncio.CancelledError:
         projectairsim_log().info("Auto flight cancelled")
         cancel_last_task_safely(drone)
@@ -2511,6 +2704,11 @@ async def run_teleport_viewer(
             current = ned_to_route(current_ned)
             current_heading = heading_deg_360(get_pose_yaw_ned(drone))
             state.update_pose(current, current_heading)
+            if state.check_battery_depleted() or state.snapshot()["coverage_unfeasible"]:
+                log_coverage_unfeasible_if_needed(state)
+                if not state.snapshot()["auto_flight_running"]:
+                    await hold_then_request_stop(state)
+                    break
             if not state.snapshot()["auto_flight_running"]:
                 state.set_route_index(nearest_route_index(state.route, current))
 
