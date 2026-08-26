@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import commentjson
 
 from projectairsim import Drone, ProjectAirSimClient, World
+from projectairsim.drone import YawControlMode
 from projectairsim.types import ImageType, Pose, Quaternion, Vector3
 from projectairsim.utils import projectairsim_log, unpack_image
 
@@ -42,14 +43,24 @@ if str(EXAMPLE_SCRIPTS_DIR) not in sys.path:
 from px4_astar_autopilot import (  # noqa: E402
     arm_with_retry,
     await_drone_task,
+    brake_to_stop_by_velocity,
+    clamp,
     distance_between,
-    fly_to_point_by_velocity,
     format_vector3,
     get_pose_position_ned,
     get_pose_yaw_ned,
     heading_deg_360,
+    limit_vector_delta,
     request_px4_control,
+    sparsify_path,
     wait_for_px4_ready,
+    wrap_angle_rad,
+)
+
+from route_replan_static import (  # noqa: E402
+    create_static_route_scan,
+    find_static_route_obstacle,
+    is_route_corridor_clear,
 )
 
 
@@ -83,6 +94,94 @@ def route_to_ned(position: Sequence[float]) -> List[float]:
 
 def ned_to_route(position_ned: Sequence[float]) -> List[float]:
     return [float(position_ned[0]), float(position_ned[1]), float(position_ned[2])]
+
+
+def interpolate_point(
+    start: Sequence[float],
+    end: Sequence[float],
+    fraction: float,
+) -> List[float]:
+    fraction = clamp(float(fraction), 0.0, 1.0)
+    return [
+        float(start[index]) + (float(end[index]) - float(start[index])) * fraction
+        for index in range(3)
+    ]
+
+
+def segment_lookahead_point(
+    start: Sequence[float],
+    end: Sequence[float],
+    position: Sequence[float],
+    lookahead_m: float,
+) -> List[float]:
+    segment = [float(end[index]) - float(start[index]) for index in range(3)]
+    segment_length_sq = sum(component * component for component in segment)
+    if segment_length_sq <= 1e-9 or lookahead_m <= 0.0:
+        return [float(end[0]), float(end[1]), float(end[2])]
+
+    offset = [float(position[index]) - float(start[index]) for index in range(3)]
+    projection_fraction = clamp(
+        sum(offset[index] * segment[index] for index in range(3))
+        / segment_length_sq,
+        0.0,
+        1.0,
+    )
+    segment_length_m = math.sqrt(segment_length_sq)
+    lookahead_fraction = lookahead_m / max(segment_length_m, 1e-6)
+    return interpolate_point(start, end, projection_fraction + lookahead_fraction)
+
+
+def append_unique_point(
+    path: List[List[float]],
+    point: Sequence[float],
+    tolerance_m: float = 1e-3,
+):
+    candidate = [float(point[0]), float(point[1]), float(point[2])]
+    if not path or distance_between(path[-1], candidate) > tolerance_m:
+        path.append(candidate)
+
+
+def segment_yaw_deg(
+    start: Sequence[float],
+    end: Sequence[float],
+    fallback_yaw_deg: float,
+) -> float:
+    dx = float(end[0]) - float(start[0])
+    dy = float(end[1]) - float(start[1])
+    if math.hypot(dx, dy) <= 1e-6:
+        return float(fallback_yaw_deg) % 360.0
+    return math.degrees(math.atan2(dy, dx)) % 360.0
+
+
+def route_points_from_path(
+    path: Sequence[Sequence[float]],
+    original_route: Sequence[RoutePoint],
+) -> List[RoutePoint]:
+    route = []
+    bypass_count = 0
+    for index, point in enumerate(path):
+        position = [float(point[0]), float(point[1]), float(point[2])]
+        matched = None
+        for original in original_route:
+            if distance_between(position, original.position) <= 0.5:
+                matched = original
+                break
+
+        if matched is not None:
+            label = matched.label
+            yaw_deg = matched.yaw_deg
+        else:
+            bypass_count += 1
+            label = f"Bypass {bypass_count:03d}"
+            if index + 1 < len(path):
+                yaw_deg = segment_yaw_deg(position, path[index + 1], original_route[0].yaw_deg)
+            elif index > 0:
+                yaw_deg = segment_yaw_deg(path[index - 1], position, original_route[-1].yaw_deg)
+            else:
+                yaw_deg = original_route[0].yaw_deg
+
+        route.append(RoutePoint(label, position, yaw_deg))
+    return route
 
 
 def vector_or_none(values: Optional[Sequence[float]]) -> str:
@@ -961,6 +1060,273 @@ def route_from_constants() -> List[RoutePoint]:
     ]
 
 
+def nearest_valid_planner_point(
+    planner,
+    args,
+    point: Sequence[float],
+    label: str,
+) -> List[float]:
+    requested = [float(point[0]), float(point[1]), float(point[2])]
+    if planner.check_coordinate_validity(requested, is_NED=True):
+        return requested
+
+    step = max(0.5, float(args.object_scan_resolution_m))
+    horizontal_radius_m = max(step, float(args.replan_endpoint_search_radius_m))
+    vertical_radius_m = max(0.0, float(args.replan_endpoint_vertical_search_m))
+    horizontal_cells = int(math.ceil(horizontal_radius_m / step))
+    vertical_cells = int(math.ceil(vertical_radius_m / step))
+
+    best = None
+    best_distance = math.inf
+    for z_cell in range(-vertical_cells, vertical_cells + 1):
+        dz = z_cell * step
+        for x_cell in range(-horizontal_cells, horizontal_cells + 1):
+            dx = x_cell * step
+            for y_cell in range(-horizontal_cells, horizontal_cells + 1):
+                dy = y_cell * step
+                horizontal_distance = math.hypot(dx, dy)
+                if horizontal_distance > horizontal_radius_m + 1e-6:
+                    continue
+
+                candidate = [requested[0] + dx, requested[1] + dy, requested[2] + dz]
+                if not planner.check_coordinate_validity(candidate, is_NED=True):
+                    continue
+
+                distance = distance_between(candidate, requested)
+                if distance < best_distance:
+                    best = candidate
+                    best_distance = distance
+
+    if best is None:
+        raise RuntimeError(
+            f"{label} point is occupied or outside the A* grid, and no nearby free "
+            f"point was found within horizontal {horizontal_radius_m:.1f}m / "
+            f"vertical {vertical_radius_m:.1f}m: {requested}"
+        )
+
+    projectairsim_log().warning(
+        "%s point %s is not free for A*. Using nearest free point %s instead "
+        "(offset %.1fm).",
+        label,
+        format_vector3(requested),
+        format_vector3(best),
+        best_distance,
+    )
+    return best
+
+
+def point_on_segment_by_fraction(
+    start: Sequence[float],
+    end: Sequence[float],
+    fraction: float,
+) -> List[float]:
+    return interpolate_point(start, end, fraction)
+
+
+def build_lateral_bypass_points(
+    planner,
+    args,
+    start: Sequence[float],
+    target: Sequence[float],
+    obstacle_point: Sequence[float],
+    label: str,
+) -> List[List[float]]:
+    segment = [float(target[index]) - float(start[index]) for index in range(3)]
+    segment_length_sq = sum(component * component for component in segment)
+    if segment_length_sq <= 1e-9:
+        return [route_to_ned(target)]
+
+    offset = [float(obstacle_point[index]) - float(start[index]) for index in range(3)]
+    obstacle_fraction = clamp(
+        sum(offset[index] * segment[index] for index in range(3)) / segment_length_sq,
+        0.0,
+        1.0,
+    )
+    segment_length_m = math.sqrt(segment_length_sq)
+    along_fraction = max(0.0, float(args.bypass_along_distance_m)) / segment_length_m
+    before_fraction = clamp(obstacle_fraction - along_fraction, 0.0, 1.0)
+    after_fraction = clamp(obstacle_fraction + along_fraction, 0.0, 1.0)
+
+    dx = segment[0]
+    dy = segment[1]
+    horizontal_length = math.hypot(dx, dy)
+    if horizontal_length <= 1e-6:
+        return [route_to_ned(target)]
+
+    left = [-dy / horizontal_length, dx / horizontal_length, 0.0]
+    lateral_offset_m = max(
+        float(args.bypass_lateral_offset_m),
+        float(args.object_path_clearance_m) * 2.0,
+    )
+
+    def shifted(fraction: float, side: float) -> List[float]:
+        base = point_on_segment_by_fraction(start, target, fraction)
+        return [
+            base[0] + left[0] * side * lateral_offset_m,
+            base[1] + left[1] * side * lateral_offset_m,
+            base[2],
+        ]
+
+    best_side = None
+    best_score = -math.inf
+    best_points = None
+    for side in (1.0, -1.0):
+        raw_points = [
+            shifted(before_fraction, side),
+            shifted(obstacle_fraction, side),
+            shifted(after_fraction, side),
+        ]
+        score = 0
+        snapped_points = []
+        for point_index, point in enumerate(raw_points, start=1):
+            if is_route_corridor_clear(planner, point, args):
+                score += 10
+                snapped_points.append(point)
+            else:
+                snapped = nearest_valid_planner_point(
+                    planner,
+                    args,
+                    point,
+                    f"{label} lateral bypass {point_index}",
+                )
+                snapped_points.append(snapped)
+                if is_route_corridor_clear(planner, snapped, args):
+                    score += 5
+
+        side_name = "left" if side > 0 else "right"
+        projectairsim_log().info(
+            "%s lateral bypass candidate %s score=%s first=%s",
+            label,
+            side_name,
+            score,
+            format_vector3(snapped_points[0]),
+        )
+        if score > best_score:
+            best_score = score
+            best_side = side_name
+            best_points = snapped_points
+
+    projectairsim_log().warning(
+        "Using %s lateral bypass for %s with %.1fm offset around obstacle %s.",
+        best_side,
+        label,
+        lateral_offset_m,
+        format_vector3(obstacle_point),
+    )
+    result = []
+    for point in best_points or []:
+        append_unique_point(result, point)
+    append_unique_point(result, target)
+    return result
+
+
+def plan_obstacle_aware_route(
+    world: World,
+    args,
+    route: Sequence[RoutePoint],
+) -> List[RoutePoint]:
+    if not args.replan_on_object or len(route) < 2:
+        return list(route)
+
+    planned_path = [route_to_ned(route[0].position)]
+    bypass_legs = 0
+
+    for index in range(1, len(route)):
+        start = planned_path[-1]
+        target = route_to_ned(route[index].position)
+        leg_path = [start, target]
+        label = f"{route[index - 1].label} -> {route[index].label}"
+
+        projectairsim_log().info(
+            "Checking leg %d/%d for obstacles: %s",
+            index,
+            len(route) - 1,
+            label,
+        )
+        scan_margin_m = float(args.object_scan_margin_m)
+        if args.obstacle_planner == "lateral":
+            scan_margin_m = max(
+                scan_margin_m,
+                float(args.bypass_lateral_offset_m)
+                + float(args.object_path_clearance_m)
+                + 2.0 * float(args.object_scan_resolution_m),
+            )
+        scan = create_static_route_scan(
+            world,
+            args,
+            leg_path,
+            log_scan=args.log_obstacle_scans,
+            margin_override_m=scan_margin_m,
+        )
+        obstacle = find_static_route_obstacle(
+            scan,
+            args,
+            leg_path,
+            log_clear=args.log_obstacle_scans,
+        )
+        if obstacle is None:
+            append_unique_point(planned_path, target)
+            continue
+
+        bypass_legs += 1
+        projectairsim_log().warning(
+            "Obstacle detected on %s at NED %s. Planning %s bypass to %s.",
+            label,
+            format_vector3(obstacle.obstacle_point),
+            args.obstacle_planner,
+            route[index].label,
+        )
+        if args.obstacle_planner == "lateral":
+            bypass_path = build_lateral_bypass_points(
+                scan.planner,
+                args,
+                start,
+                target,
+                obstacle.obstacle_point,
+                label,
+            )
+            projectairsim_log().warning(
+                "Lateral bypass for %s: inserted %d route point(s)",
+                label,
+                len(bypass_path),
+            )
+            for point in bypass_path:
+                append_unique_point(planned_path, point)
+            continue
+
+        plan_start = nearest_valid_planner_point(scan.planner, args, start, f"{label} start")
+        plan_target = nearest_valid_planner_point(scan.planner, args, target, f"{label} target")
+        dense_path = scan.planner.generate_plan(plan_start, plan_target)
+        if not dense_path:
+            raise RuntimeError(f"A* did not find an obstacle bypass for {label}")
+
+        bypass_path = sparsify_path(
+            [[float(point[0]), float(point[1]), float(point[2])] for point in dense_path],
+            args.replan_waypoint_spacing_m,
+        )
+        projectairsim_log().warning(
+            "A* bypass for %s: %d dense points -> %d route points",
+            label,
+            len(dense_path),
+            len(bypass_path),
+        )
+        for point in bypass_path[1:]:
+            append_unique_point(planned_path, point)
+
+    if bypass_legs == 0:
+        projectairsim_log().info("Obstacle planner: original route corridor is clear")
+        return list(route)
+
+    planned_route = route_points_from_path(planned_path, route)
+    projectairsim_log().warning(
+        "Obstacle planner expanded route from %d to %d points across %d bypass leg(s)",
+        len(route),
+        len(planned_route),
+        bypass_legs,
+    )
+    return planned_route
+
+
 def drain_teleport_request(state: DemoState) -> Optional[int]:
     delta = None
     while not state.teleport_requests.empty():
@@ -1293,6 +1659,144 @@ async def settle_and_sample(
     update_drone_diagnostics(drone, state, world, object_name)
 
 
+async def fly_route_segment_smooth(
+    drone: Drone,
+    state: DemoState,
+    args,
+    previous_target: Sequence[float],
+    target: Sequence[float],
+    label: str,
+    waypoint_index: int,
+    is_final_waypoint: bool,
+    commanded_velocity: Sequence[float],
+    timeout_sec: float,
+    world: Optional[World] = None,
+) -> List[float]:
+    command_duration_sec = max(0.05, args.velocity_command_duration_sec)
+    max_velocity_delta = max(0.0, args.velocity_acceleration_limit_mps2) * command_duration_sec
+    max_yaw_rate_radps = math.radians(max(0.0, args.path_yaw_rate_dps))
+    yaw_deadband_rad = math.radians(max(0.0, args.path_yaw_deadband_deg))
+    yaw_response_sec = max(command_duration_sec, args.path_yaw_response_sec)
+    slowdown_distance_m = max(args.route_acceptance_m, args.slowdown_distance_m)
+    velocity_lookahead_m = max(0.0, args.velocity_lookahead_m)
+    segment_delta = [
+        float(target[0]) - float(previous_target[0]),
+        float(target[1]) - float(previous_target[1]),
+    ]
+    segment_has_heading = math.hypot(segment_delta[0], segment_delta[1]) > 0.1
+    velocity = [
+        float(commanded_velocity[0]),
+        float(commanded_velocity[1]),
+        float(commanded_velocity[2]),
+    ]
+    started_at = time.time()
+    last_report_at = 0.0
+
+    while not state.snapshot()["stop_requested"]:
+        current = get_pose_position_ned(drone)
+        distance = distance_between(current, target)
+        state.update_pose(ned_to_route(current), heading_deg_360(get_pose_yaw_ned(drone)))
+
+        if distance <= args.route_acceptance_m:
+            if is_final_waypoint:
+                velocity = await brake_to_stop_by_velocity(
+                    drone,
+                    velocity,
+                    command_duration_sec,
+                    max_velocity_delta,
+                )
+            projectairsim_log().info(
+                "%s reached target %s; pose NED %s; error %.2f m",
+                label,
+                format_vector3(target),
+                format_vector3(current),
+                distance,
+            )
+            return velocity
+
+        elapsed = time.time() - started_at
+        if timeout_sec > 0.0 and elapsed > timeout_sec:
+            cancel_last_task_safely(drone)
+            raise RuntimeError(
+                f"{label} timed out after {timeout_sec:.1f}s; "
+                f"target {format_vector3(target)}, pose NED {format_vector3(current)}, "
+                f"remaining {distance:.2f} m"
+            )
+
+        if elapsed - last_report_at >= args.pose_report_interval_sec:
+            projectairsim_log().info(
+                "%s following segment to %s; pose NED %s; remaining %.2f m",
+                label,
+                format_vector3(target),
+                format_vector3(current),
+                distance,
+            )
+            update_drone_diagnostics(drone, state, world, args.drone_name)
+            last_report_at = elapsed
+
+        steering_target = segment_lookahead_point(
+            previous_target,
+            target,
+            current,
+            velocity_lookahead_m,
+        )
+        if is_final_waypoint and distance <= slowdown_distance_m:
+            steering_target = [float(target[0]), float(target[1]), float(target[2])]
+
+        steering_distance = distance_between(current, steering_target)
+        if steering_distance <= 1e-6:
+            steering_target = [float(target[0]), float(target[1]), float(target[2])]
+            steering_distance = distance
+
+        delta = [steering_target[index] - current[index] for index in range(3)]
+        speed_scale = 1.0
+        if is_final_waypoint:
+            speed_scale = min(1.0, max(0.2, distance / slowdown_distance_m))
+        desired_speed = min(
+            args.route_speed_mps,
+            steering_distance / command_duration_sec,
+        ) * speed_scale
+        desired_velocity = [
+            (component / steering_distance) * desired_speed
+            for component in delta
+        ]
+        velocity = limit_vector_delta(velocity, desired_velocity, max_velocity_delta)
+
+        yaw_rate_radps = 0.0
+        horizontal_speed = math.hypot(velocity[0], velocity[1])
+        if (
+            args.face_travel_direction
+            and segment_has_heading
+            and horizontal_speed > 0.05
+            and max_yaw_rate_radps > 0.0
+        ):
+            desired_yaw = math.atan2(segment_delta[1], segment_delta[0])
+            yaw_error = wrap_angle_rad(desired_yaw - get_pose_yaw_ned(drone))
+            if abs(yaw_error) > yaw_deadband_rad:
+                yaw_error_to_close = math.copysign(
+                    abs(yaw_error) - yaw_deadband_rad,
+                    yaw_error,
+                )
+                yaw_rate_radps = clamp(
+                    yaw_error_to_close / yaw_response_sec,
+                    -max_yaw_rate_radps,
+                    max_yaw_rate_radps,
+                )
+
+        await drone.move_by_velocity_async(
+            v_north=velocity[0],
+            v_east=velocity[1],
+            v_down=velocity[2],
+            duration=command_duration_sec,
+            yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
+            yaw_is_rate=True,
+            yaw=yaw_rate_radps,
+        )
+        await asyncio.sleep(command_duration_sec)
+
+    return velocity
+
+
 async def run_route_auto_flight(
     drone: Drone,
     state: DemoState,
@@ -1367,22 +1871,19 @@ async def run_route_auto_flight(
                 args.route_speed_mps,
                 timeout_sec,
             )
-            commanded_velocity = await fly_to_point_by_velocity(
+            previous_ned = route_to_ned(state.route[index - 1].position)
+            commanded_velocity = await fly_route_segment_smooth(
                 drone,
+                state,
+                args,
+                previous_ned,
                 target_ned,
-                args.route_speed_mps,
-                args.route_acceptance_m,
-                timeout_sec,
-                args.pose_report_interval_sec,
-                args.face_travel_direction,
                 point.label,
-                args.velocity_command_duration_sec,
-                args.velocity_acceleration_limit_mps2,
-                args.slowdown_distance_m,
-                args.path_yaw_rate_dps,
-                commanded_velocity,
+                index,
                 index == len(state.route) - 1,
-                index == 1,
+                commanded_velocity,
+                timeout_sec,
+                world,
             )
             current_ned = get_pose_position_ned(drone)
             state.update_pose(ned_to_route(current_ned), heading_deg_360(get_pose_yaw_ned(drone)))
@@ -1521,24 +2022,18 @@ async def run_teleport_viewer(
 
 async def run_demo(args):
     route = route_from_constants()
-    state = DemoState(route)
+    state = None
     temp_config_dir = None
     drone = None
+    preview = None
     client = ProjectAirSimClient(
         address=args.server_ip,
         port_topics=args.topics_port,
         port_services=args.services_port,
     )
-    preview = OffshorePreview(
-        state,
-        args.window_name,
-        args.preview_width,
-        args.preview_height,
-        args.pip_scale,
-        args.preview_fps,
-    )
 
     try:
+        mode_flight = "auto-diagnostic" if args.auto_diagnostic else args.mode_flight
         temp_config_dir, scene_name, sim_config_path = make_runtime_scene_config(args, route)
 
         projectairsim_log().info("Connecting to Project AirSim")
@@ -1569,6 +2064,18 @@ async def run_demo(args):
                 f"{available_topics}"
             )
 
+        if mode_flight == "auto-flight":
+            route = plan_obstacle_aware_route(world, args, route)
+
+        state = DemoState(route)
+        preview = OffshorePreview(
+            state,
+            args.window_name,
+            args.preview_width,
+            args.preview_height,
+            args.pip_scale,
+            args.preview_fps,
+        )
         preview.start()
         client.subscribe(fpv_topic, preview.receive_fpv)
         client.subscribe(chase_topic, preview.receive_chase)
@@ -1587,7 +2094,6 @@ async def run_demo(args):
             format_vector3(initial_pose_route),
         )
 
-        mode_flight = "auto-diagnostic" if args.auto_diagnostic else args.mode_flight
         if mode_flight == "auto-diagnostic":
             state.set_mode("auto diagnostic", "automatic teleport snapshots")
             await run_auto_diagnostic_mission(drone, state, args, world)
@@ -1604,9 +2110,11 @@ async def run_demo(args):
             state.set_mode("teleport", "manual teleport mode")
             await run_teleport_viewer(drone, state, args, world)
     finally:
-        state.request_stop()
-        preview.stop()
-        if preview.error is not None:
+        if state is not None:
+            state.request_stop()
+        if preview is not None:
+            preview.stop()
+        if preview is not None and preview.error is not None:
             projectairsim_log().warning("Preview stopped with error: %s", preview.error)
         try:
             client.unsubscribe_all()
@@ -1638,6 +2146,114 @@ def build_parser():
         choices=["teleport", "auto-flight", "auto-diagnostic"],
         default="teleport",
         help="Startup mode: manual teleport viewer, immediate PX4 route flight, or teleport diagnostics.",
+    )
+    parser.set_defaults(replan_on_object=True)
+    parser.add_argument(
+        "--replan-on-object",
+        dest="replan_on_object",
+        action="store_true",
+        help="Before auto flight, scan route legs and A* around occupied objects.",
+    )
+    parser.add_argument(
+        "--no-replan-on-object",
+        dest="replan_on_object",
+        action="store_false",
+        help="Disable obstacle-aware A* route expansion before auto flight.",
+    )
+    parser.add_argument(
+        "--log-obstacle-scans",
+        action="store_true",
+        help="Print detailed voxel scan messages for each route leg.",
+    )
+    parser.add_argument(
+        "--obstacle-planner",
+        choices=["lateral", "astar"],
+        default="lateral",
+        help="Obstacle bypass planner: compact lateral detours or full A* leg expansion.",
+    )
+    parser.add_argument(
+        "--ignore-actor",
+        action="append",
+        default=[],
+        help="Actor to ignore in obstacle voxel grids. Repeatable.",
+    )
+    parser.add_argument(
+        "--ground-z-ned",
+        type=float,
+        default=200.0,
+        help="Ground/down value used by A* validity checks for offshore planning.",
+    )
+    parser.add_argument(
+        "--object-path-clearance-m",
+        type=float,
+        default=15.0,
+        help="Horizontal route corridor radius that counts as blocked by objects.",
+    )
+    parser.add_argument(
+        "--object-scan-resolution-m",
+        type=float,
+        default=5.0,
+        help="Voxel-grid resolution for obstacle route scanning and A* bypasses.",
+    )
+    parser.add_argument(
+        "--object-scan-sample-spacing-m",
+        type=float,
+        default=5.0,
+        help="Spacing between route samples checked for obstacle occupancy.",
+    )
+    parser.add_argument(
+        "--object-scan-margin-m",
+        type=float,
+        default=80.0,
+        help="Extra meters around each route leg when creating the A* scan grid.",
+    )
+    parser.add_argument(
+        "--object-scan-min-size-m",
+        type=float,
+        default=40.0,
+        help="Minimum x/y/z size for each obstacle scan grid.",
+    )
+    parser.add_argument(
+        "--object-scan-start-ignore-m",
+        type=float,
+        default=5.0,
+        help="Ignore occupied route samples this close to the start of a leg.",
+    )
+    parser.add_argument(
+        "--object-stop-distance-m",
+        type=float,
+        default=20.0,
+        help="Distance before a blocked sample used for diagnostic obstacle reporting.",
+    )
+    parser.add_argument(
+        "--replan-waypoint-spacing-m",
+        type=float,
+        default=15.0,
+        help="Minimum spacing between generated A* bypass waypoints.",
+    )
+    parser.add_argument(
+        "--bypass-lateral-offset-m",
+        type=float,
+        default=90.0,
+        help="Side offset used by the compact lateral obstacle bypass planner.",
+    )
+    parser.add_argument(
+        "--bypass-along-distance-m",
+        type=float,
+        default=70.0,
+        help="Distance before/after the detected obstacle used by the lateral bypass.",
+    )
+    parser.add_argument(
+        "--replan-endpoint-search-radius-m",
+        type=float,
+        default=80.0,
+        help="Horizontal radius used to snap an occupied A* start/target to nearby free space.",
+    )
+    parser.add_argument(
+        "--replan-endpoint-vertical-search-m",
+        type=float,
+        default=40.0,
+        help="Vertical radius used to snap an occupied A* start/target to nearby free space.",
     )
     parser.add_argument(
         "--auto-diagnostic",
@@ -1714,8 +2330,17 @@ def build_parser():
     parser.add_argument(
         "--velocity-acceleration-limit-mps2",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Maximum velocity change rate in velocity route mode.",
+    )
+    parser.add_argument(
+        "--velocity-lookahead-m",
+        type=float,
+        default=8.0,
+        help=(
+            "Distance ahead on the current route segment used by velocity route "
+            "mode. This prevents side-to-side waypoint-center chasing."
+        ),
     )
     parser.add_argument(
         "--slowdown-distance-m",
@@ -1726,8 +2351,20 @@ def build_parser():
     parser.add_argument(
         "--path-yaw-rate-dps",
         type=float,
-        default=15.0,
-        help="Maximum yaw rate used by --face-travel-direction in velocity route mode.",
+        default=10.0,
+        help="Maximum yaw rate used while facing the planned route segment.",
+    )
+    parser.add_argument(
+        "--path-yaw-deadband-deg",
+        type=float,
+        default=5.0,
+        help="Yaw error ignored while facing the planned route segment.",
+    )
+    parser.add_argument(
+        "--path-yaw-response-sec",
+        type=float,
+        default=1.5,
+        help="Seconds over which route-facing yaw tries to close heading error.",
     )
     parser.add_argument(
         "--face-travel-direction",
