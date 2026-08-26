@@ -2021,7 +2021,8 @@ async def fly_route_segment_smooth(
         delta = [steering_target[index] - current[index] for index in range(3)]
         speed_scale = 1.0
         if stop_at_target:
-            speed_scale = min(1.0, max(0.05, distance / max(slowdown_distance_m, 1e-6)))
+            approach_ratio = clamp(distance / max(slowdown_distance_m, 1e-6), 0.0, 1.0)
+            speed_scale = max(0.08, approach_ratio * approach_ratio)
         desired_speed = min(
             args.route_speed_mps,
             steering_distance / command_duration_sec,
@@ -2085,13 +2086,37 @@ async def align_to_waypoint_yaw(
     if not args.align_yaw_at_waypoints:
         return
 
+    await align_to_heading(
+        drone,
+        state,
+        args,
+        target_yaw_deg,
+        label,
+        world,
+        args.waypoint_yaw_rate_dps,
+        args.waypoint_yaw_acceptance_deg,
+        args.waypoint_yaw_timeout_sec,
+    )
+
+
+async def align_to_heading(
+    drone: Drone,
+    state: DemoState,
+    args,
+    target_yaw_deg: float,
+    label: str,
+    world: Optional[World],
+    yaw_rate_dps: float,
+    yaw_acceptance_deg: float,
+    yaw_timeout_sec: float,
+):
     command_duration_sec = max(0.05, args.velocity_command_duration_sec)
-    max_yaw_rate_radps = math.radians(max(0.0, args.waypoint_yaw_rate_dps))
+    max_yaw_rate_radps = math.radians(max(0.0, yaw_rate_dps))
     if max_yaw_rate_radps <= 0.0:
         return
 
     target_yaw_rad = math.radians(float(target_yaw_deg) % 360.0)
-    yaw_acceptance_rad = math.radians(max(0.0, args.waypoint_yaw_acceptance_deg))
+    yaw_acceptance_rad = math.radians(max(0.0, yaw_acceptance_deg))
     yaw_response_sec = max(command_duration_sec, args.path_yaw_response_sec)
     started_at = time.time()
     last_report_at = 0.0
@@ -2113,7 +2138,7 @@ async def align_to_waypoint_yaw(
             return
 
         elapsed = time.time() - started_at
-        if args.waypoint_yaw_timeout_sec > 0.0 and elapsed > args.waypoint_yaw_timeout_sec:
+        if yaw_timeout_sec > 0.0 and elapsed > yaw_timeout_sec:
             projectairsim_log().warning(
                 "%s yaw alignment timed out at %.1f deg; target %.1f deg; error %.1f deg",
                 label,
@@ -2166,6 +2191,12 @@ async def run_route_auto_flight(
     commanded_velocity = [0.0, 0.0, 0.0]
     failed = False
     try:
+        if not args.face_travel_direction:
+            projectairsim_log().warning(
+                "--no-face-travel-direction is ignored in offshore auto-flight; "
+                "the drone always faces the active route segment."
+            )
+            args.face_travel_direction = True
         projectairsim_log().info(
             "Auto flight requested: teleporting to Origin, then flying %d route points at %.1f m/s",
             len(state.route),
@@ -2253,6 +2284,19 @@ async def run_route_auto_flight(
                 leg_behavior,
             )
             previous_ned = route_to_ned(state.route[index - 1].position)
+            if args.face_travel_direction and leg_distance_m > args.route_acceptance_m:
+                travel_yaw_deg = segment_yaw_deg(previous_ned, target_ned, point.yaw_deg)
+                await align_to_heading(
+                    drone,
+                    state,
+                    args,
+                    travel_yaw_deg,
+                    f"{point.label} travel heading",
+                    world,
+                    args.path_yaw_rate_dps,
+                    args.path_yaw_deadband_deg,
+                    args.travel_yaw_timeout_sec,
+                )
             commanded_velocity = await fly_route_segment_smooth(
                 drone,
                 state,
@@ -2835,26 +2879,32 @@ def build_parser():
     parser.add_argument(
         "--slowdown-distance-m",
         type=float,
-        default=4.0,
+        default=30.0,
         help="Distance over which velocity route mode eases down near each waypoint.",
     )
     parser.add_argument(
         "--path-yaw-rate-dps",
         type=float,
-        default=10.0,
+        default=45.0,
         help="Maximum yaw rate used while facing the planned route segment.",
     )
     parser.add_argument(
         "--path-yaw-deadband-deg",
         type=float,
-        default=5.0,
+        default=2.0,
         help="Yaw error ignored while facing the planned route segment.",
     )
     parser.add_argument(
         "--path-yaw-response-sec",
         type=float,
-        default=1.5,
+        default=0.8,
         help="Seconds over which route-facing yaw tries to close heading error.",
+    )
+    parser.add_argument(
+        "--travel-yaw-timeout-sec",
+        type=float,
+        default=8.0,
+        help="Maximum time spent turning toward the next route segment before moving.",
     )
     parser.add_argument(
         "--align-yaw-at-waypoints",
@@ -2898,7 +2948,7 @@ def build_parser():
         "--no-face-travel-direction",
         dest="face_travel_direction",
         action="store_false",
-        help="Keep PX4 yaw control from turning toward the travel direction.",
+        help="Legacy accepted flag; offshore auto-flight still faces the active route segment.",
     )
     parser.add_argument("--fpv-camera", default="FrontCamera")
     parser.add_argument("--chase-camera", default="Chase")
