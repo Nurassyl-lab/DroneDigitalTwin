@@ -9,6 +9,7 @@ between the route points.
 Controls in the OpenCV preview:
   e  teleport to next route point
   r  teleport to previous route point
+  t  enter custom teleport as x,y,z,angle
   q/esc  stop the route and exit
 """
 
@@ -82,6 +83,7 @@ class DemoState:
         self.position = list(self.route[0].position)
         self.heading_deg = self.route[0].yaw_deg
         self.teleport_requests = queue.SimpleQueue()
+        self.manual_teleport_requests = queue.SimpleQueue()
         self.stop_requested = False
         self.lock = Lock()
 
@@ -107,6 +109,9 @@ class DemoState:
 
     def queue_teleport(self, delta: int):
         self.teleport_requests.put(delta)
+
+    def queue_manual_teleport(self):
+        self.manual_teleport_requests.put(True)
 
     def request_stop(self):
         with self.lock:
@@ -235,6 +240,8 @@ class OffshorePreview:
             self.state.queue_teleport(1)
         elif key == ord("r"):
             self.state.queue_teleport(-1)
+        elif key in (ord("t"), ord("T")):
+            self.state.queue_manual_teleport()
         elif key in (ord("q"), 27):
             self.state.request_stop()
             self.running = False
@@ -331,7 +338,7 @@ class OffshorePreview:
             f"Target: {target.label}  {distance:.1f} m",
             f"NED: x={position[0]:.1f} y={position[1]:.1f} z={position[2]:.1f}",
             f"Heading: {snapshot['heading_deg']:.1f} deg  Mode: teleport only",
-            "e next waypoint | r previous waypoint | q/esc quit",
+            "e next | r previous | t custom x,y,z,angle | q/esc quit",
         ]
         y = frame.shape[0] - 92
         for line in lines:
@@ -614,6 +621,24 @@ def drain_teleport_request(state: DemoState) -> Optional[int]:
     return (snapshot["current_index"] + delta_total) % route_len
 
 
+def drain_manual_teleport_request(state: DemoState) -> bool:
+    requested = False
+    while not state.manual_teleport_requests.empty():
+        state.manual_teleport_requests.get()
+        requested = True
+    return requested
+
+
+def parse_manual_teleport(value: str) -> RoutePoint:
+    cleaned = value.strip().strip("[]()")
+    parts = cleaned.replace(",", " ").split()
+    if len(parts) != 4:
+        raise ValueError("expected x,y,z,angle")
+
+    numbers = [float(part) for part in parts]
+    return RoutePoint("Custom", numbers[:3], numbers[3])
+
+
 async def apply_teleport(drone: Drone, state: DemoState, index: int):
     point = state.route[index]
     drone.cancel_last_task()
@@ -635,15 +660,49 @@ async def apply_teleport(drone: Drone, state: DemoState, index: int):
     )
 
 
+async def prompt_manual_teleport(drone: Drone, state: DemoState):
+    value = (
+        await asyncio.to_thread(
+            input,
+            "\nTeleport NED [x,y,z,angle] (blank/cancel to skip): ",
+        )
+    ).strip()
+    if not value or value.lower() in {"c", "cancel", "q", "quit"}:
+        projectairsim_log().info("Custom teleport cancelled")
+        return
+
+    try:
+        point = parse_manual_teleport(value)
+    except ValueError as exc:
+        projectairsim_log().warning("Invalid custom teleport '%s': %s", value, exc)
+        return
+
+    target_ned = route_to_ned(point.position)
+    drone.cancel_last_task()
+    drone.set_pose(make_pose_ned_yaw(target_ned, point.yaw_deg), reset_kinematics=True)
+    await asyncio.sleep(0.1)
+    actual_ned = get_pose_position_ned(drone)
+    actual_route = ned_to_route(actual_ned)
+    state.update_pose(actual_route, point.yaw_deg)
+    projectairsim_log().info(
+        "Teleported to custom NED requested=%s actual=%s heading=%.1f deg",
+        format_vector3(target_ned),
+        format_vector3(actual_ned),
+        point.yaw_deg % 360.0,
+    )
+
+
 async def run_teleport_viewer(drone: Drone, state: DemoState, args):
     await apply_teleport(drone, state, 0)
-    projectairsim_log().info("Teleport-only mode active. Press e/r in the preview.")
+    projectairsim_log().info("Teleport-only mode active. Press e/r/t in the preview.")
     last_report_at = 0.0
 
     while not state.snapshot()["stop_requested"]:
         teleport_index = drain_teleport_request(state)
         if teleport_index is not None:
             await apply_teleport(drone, state, teleport_index)
+        if drain_manual_teleport_request(state):
+            await prompt_manual_teleport(drone, state)
 
         current_ned = get_pose_position_ned(drone)
         current = ned_to_route(current_ned)
@@ -716,7 +775,7 @@ async def run_demo(args):
         client.subscribe(fpv_topic, preview.receive_fpv)
         client.subscribe(chase_topic, preview.receive_chase)
         projectairsim_log().info(
-            "Preview opened. Controls: e next waypoint, r previous waypoint, q/esc quit"
+            "Preview opened. Controls: e next, r previous, t custom teleport, q/esc quit"
         )
 
         await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
