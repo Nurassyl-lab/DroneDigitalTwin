@@ -2885,7 +2885,7 @@ def build_parser():
     parser.add_argument(
         "--path-yaw-rate-dps",
         type=float,
-        default=45.0,
+        default=25.0,
         help="Maximum yaw rate used while facing the planned route segment.",
     )
     parser.add_argument(
@@ -2928,7 +2928,7 @@ def build_parser():
     parser.add_argument(
         "--waypoint-yaw-rate-dps",
         type=float,
-        default=45.0,
+        default=5.0,
         help="Maximum yaw rate while stopped at a named waypoint.",
     )
     parser.add_argument(
