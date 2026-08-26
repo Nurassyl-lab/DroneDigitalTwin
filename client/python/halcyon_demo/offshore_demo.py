@@ -29,7 +29,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import commentjson
 
 from projectairsim import Drone, ProjectAirSimClient, World
-from projectairsim.types import Pose, Quaternion, Vector3
+from projectairsim.types import ImageType, Pose, Quaternion, Vector3
 from projectairsim.utils import projectairsim_log, unpack_image
 
 
@@ -54,10 +54,15 @@ OFFSHORE_ROUTE = [
     ("Waypoint 2", [893.69, 7.89, -112.77], 324.3),
     ("Waypoint 3", [899.44, -892.28, -12.28], 279.5),
     ("Waypoint 4", [-3.35, -907.1, -114.81], 55.2),
-    ("Waypoint 5", [-894.61, -901.37, 114.0], 159.9),
+    ("Waypoint 5", [-894.61, -901.37, -114.0], 159.9),
     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
 ]
+
+TELEPORT_WARN_ERROR_M = 5.0
+FPV_MAX_CAMERA_OFFSET_M = 8.0
+CHASE_MAX_CAMERA_OFFSET_M = 13.0
+WARNED_UNAVAILABLE = set()
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,113 @@ def ned_to_route(position_ned: Sequence[float]) -> List[float]:
     return [float(position_ned[0]), float(position_ned[1]), float(position_ned[2])]
 
 
+def vector_or_none(values: Optional[Sequence[float]]) -> str:
+    if values is None:
+        return "n/a"
+    return f"{values[0]:8.2f} {values[1]:8.2f} {values[2]:8.2f}"
+
+
+def compact_vector(values: Optional[Sequence[float]]) -> str:
+    if values is None:
+        return "n/a"
+    return f"[{values[0]:.1f}, {values[1]:.1f}, {values[2]:.1f}]"
+
+
+def rotation_yaw_deg(rotation) -> Optional[float]:
+    if not rotation:
+        return None
+    try:
+        w = float(rotation["w"])
+        x = float(rotation["x"])
+        y = float(rotation["y"])
+        z = float(rotation["z"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    yaw_rad = math.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+    return heading_deg_360(yaw_rad)
+
+
+def extract_pose_position(pose_or_kinematics) -> Optional[List[float]]:
+    if not isinstance(pose_or_kinematics, dict):
+        return None
+    pose = pose_or_kinematics.get("pose", pose_or_kinematics)
+    if not isinstance(pose, dict):
+        return None
+    position = (
+        pose.get("position")
+        or pose.get("translation")
+        or pose.get("Position")
+        or pose.get("Translation")
+    )
+    if not isinstance(position, dict):
+        return None
+    try:
+        return [
+            float(position["x"]),
+            float(position["y"]),
+            float(position["z"]),
+        ]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def extract_pose_yaw_deg(pose_or_kinematics) -> Optional[float]:
+    if not isinstance(pose_or_kinematics, dict):
+        return None
+    pose = pose_or_kinematics.get("pose", pose_or_kinematics)
+    if not isinstance(pose, dict):
+        return None
+    return rotation_yaw_deg(pose.get("orientation") or pose.get("rotation"))
+
+
+def image_pose_position(image) -> Optional[List[float]]:
+    if not isinstance(image, dict):
+        return None
+    keys = ("pos_x", "pos_y", "pos_z")
+    if not all(key in image for key in keys):
+        return None
+    try:
+        return [float(image["pos_x"]), float(image["pos_y"]), float(image["pos_z"])]
+    except (TypeError, ValueError):
+        return None
+
+
+def image_pose_yaw_deg(image) -> Optional[float]:
+    if not isinstance(image, dict):
+        return None
+    keys = ("rot_w", "rot_x", "rot_y", "rot_z")
+    if not all(key in image for key in keys):
+        return None
+    return rotation_yaw_deg(
+        {
+            "w": image["rot_w"],
+            "x": image["rot_x"],
+            "y": image["rot_y"],
+            "z": image["rot_z"],
+        }
+    )
+
+
+def geo_summary(value) -> str:
+    if not isinstance(value, dict):
+        return "n/a"
+    geo = value.get("geo_point") or value.get("gnss", {}).get("geo_point") or value
+    if not isinstance(geo, dict):
+        return "n/a"
+    lat = geo.get("latitude", geo.get("lat"))
+    lon = geo.get("longitude", geo.get("lon"))
+    alt = geo.get("altitude", geo.get("alt"))
+    if lat is None or lon is None or alt is None:
+        return "n/a"
+    try:
+        return f"lat={float(lat):.7f} lon={float(lon):.7f} alt={float(alt):.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 class DemoState:
     def __init__(self, route: Sequence[RoutePoint]):
         self.route = list(route)
@@ -82,6 +194,11 @@ class DemoState:
         self.target_index = 1
         self.position = list(self.route[0].position)
         self.heading_deg = self.route[0].yaw_deg
+        self.last_requested_label = "Scene origin"
+        self.last_requested_position = list(self.route[0].position)
+        self.last_requested_yaw_deg = self.route[0].yaw_deg
+        self.diagnostics = {}
+        self.camera_epoch = 0
         self.teleport_requests = queue.SimpleQueue()
         self.manual_teleport_requests = queue.SimpleQueue()
         self.stop_requested = False
@@ -94,6 +211,11 @@ class DemoState:
                 "target_index": self.target_index,
                 "position": list(self.position),
                 "heading_deg": self.heading_deg,
+                "last_requested_label": self.last_requested_label,
+                "last_requested_position": list(self.last_requested_position),
+                "last_requested_yaw_deg": self.last_requested_yaw_deg,
+                "diagnostics": dict(self.diagnostics),
+                "camera_epoch": self.camera_epoch,
                 "stop_requested": self.stop_requested,
             }
 
@@ -102,7 +224,61 @@ class DemoState:
             self.position = [float(position[0]), float(position[1]), float(position[2])]
             self.heading_deg = float(heading_deg) % 360.0
 
+    def update_requested(
+        self,
+        label: str,
+        position: Sequence[float],
+        yaw_deg: float,
+    ):
+        with self.lock:
+            self.last_requested_label = label
+            self.last_requested_position = [
+                float(position[0]),
+                float(position[1]),
+                float(position[2]),
+            ]
+            self.last_requested_yaw_deg = float(yaw_deg) % 360.0
+
+    def update_diagnostic(
+        self,
+        name: str,
+        position: Optional[Sequence[float]] = None,
+        yaw_deg: Optional[float] = None,
+        extra: str = "",
+    ):
+        with self.lock:
+            self.diagnostics[name] = {
+                "position": (
+                    [float(position[0]), float(position[1]), float(position[2])]
+                    if position is not None
+                    else None
+                ),
+                "yaw_deg": float(yaw_deg) % 360.0 if yaw_deg is not None else None,
+                "extra": extra,
+                "time": time.time(),
+            }
+
+    def update_image_diagnostic(self, name: str, image):
+        position = image_pose_position(image)
+        yaw_deg = image_pose_yaw_deg(image)
+        extra = ""
+        if isinstance(image, dict):
+            width = image.get("width")
+            height = image.get("height")
+            if width is not None and height is not None:
+                extra = f"{width}x{height}"
+        self.update_diagnostic(name, position, yaw_deg, extra)
+
+    def bump_camera_epoch(self):
+        with self.lock:
+            self.camera_epoch += 1
+
     def mark_reached(self, index: int):
+        with self.lock:
+            self.current_index = index
+            self.target_index = min(index + 1, len(self.route) - 1)
+
+    def set_route_index(self, index: int):
         with self.lock:
             self.current_index = index
             self.target_index = min(index + 1, len(self.route) - 1)
@@ -139,6 +315,10 @@ class OffshorePreview:
         self.running = False
         self.thread = None
         self.error = None
+        self.last_key_at = {}
+        self.key_debounce_sec = 0.25
+        self.camera_epoch_seen = state.snapshot()["camera_epoch"]
+        self.waiting_for_fresh_fpv = False
 
         xs = [point.position[0] for point in self.state.route]
         ys = [point.position[1] for point in self.state.route]
@@ -161,10 +341,45 @@ class OffshorePreview:
         self.thread = None
 
     def receive_fpv(self, _, image):
+        self.state.update_image_diagnostic("FPV camera msg", image)
+        if not self.camera_frame_is_near_drone(
+            image,
+            FPV_MAX_CAMERA_OFFSET_M,
+            "FPV camera msg",
+        ):
+            return
         self._push_latest(self.fpv_images, image)
 
     def receive_chase(self, _, image):
+        self.state.update_image_diagnostic("Chase camera msg", image)
+        if not self.camera_frame_is_near_drone(
+            image,
+            CHASE_MAX_CAMERA_OFFSET_M,
+            "Chase camera msg",
+        ):
+            return
         self._push_latest(self.chase_images, image)
+
+    def camera_frame_is_near_drone(
+        self,
+        image,
+        max_offset_m: float,
+        diagnostic_name: str,
+    ) -> bool:
+        camera_position = image_pose_position(image)
+        if camera_position is None:
+            return True
+        drone_position = self.state.snapshot()["position"]
+        offset_m = distance_between(camera_position, drone_position)
+        if offset_m <= max_offset_m:
+            return True
+        self.state.update_diagnostic(
+            diagnostic_name,
+            camera_position,
+            image_pose_yaw_deg(image),
+            f"STALE offset={offset_m:.1f}m",
+        )
+        return False
 
     def _push_latest(self, image_queue, image):
         if not self.running or image is None:
@@ -184,6 +399,24 @@ class OffshorePreview:
             return None
         return frame.copy()
 
+    @staticmethod
+    def drain_queue(image_queue):
+        while not image_queue.empty():
+            image_queue.get()
+
+    def make_waiting_frame(self, cv2):
+        import numpy as np
+
+        frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        self.draw_text(
+            cv2,
+            frame,
+            "Waiting for fresh FPV camera frame after teleport",
+            (18, 32),
+            scale=0.65,
+        )
+        return frame
+
     def display_loop(self):
         import cv2
 
@@ -192,6 +425,13 @@ class OffshorePreview:
         next_frame_at = time.monotonic()
         try:
             while self.running:
+                snapshot = self.state.snapshot()
+                if snapshot["camera_epoch"] != self.camera_epoch_seen:
+                    self.drain_queue(self.fpv_images)
+                    self.drain_queue(self.chase_images)
+                    self.camera_epoch_seen = snapshot["camera_epoch"]
+                    self.waiting_for_fresh_fpv = True
+
                 now = time.monotonic()
                 if now < next_frame_at:
                     key = cv2.waitKey(max(1, int((next_frame_at - now) * 1000.0)))
@@ -200,11 +440,24 @@ class OffshorePreview:
 
                 fpv = self._pop_latest_frame(self.fpv_images)
                 if fpv is None:
+                    if self.waiting_for_fresh_fpv:
+                        frame = self.make_waiting_frame(cv2)
+                        self.draw_route_overlay(cv2, frame)
+                        self.draw_status(cv2, frame)
+                        self.draw_diagnostics(cv2, frame)
+                        if not created:
+                            cv2.namedWindow(
+                                self.window_name,
+                                flags=cv2.WINDOW_GUI_NORMAL + cv2.WINDOW_AUTOSIZE,
+                            )
+                            created = True
+                        cv2.imshow(self.window_name, frame)
                     key = cv2.waitKey(1)
                     self.handle_key(key)
                     continue
 
                 frame = fpv
+                self.waiting_for_fresh_fpv = False
                 frame = self.ensure_bgr(cv2, frame)
                 frame = cv2.resize(frame, (self.width, self.height))
                 chase = self._pop_latest_frame(self.chase_images)
@@ -214,6 +467,7 @@ class OffshorePreview:
 
                 self.draw_route_overlay(cv2, frame)
                 self.draw_status(cv2, frame)
+                self.draw_diagnostics(cv2, frame)
 
                 if not created:
                     cv2.namedWindow(
@@ -237,14 +491,25 @@ class OffshorePreview:
             return
         key &= 0xFF
         if key == ord("e"):
-            self.state.queue_teleport(1)
+            if self.accept_key("e"):
+                self.state.queue_teleport(1)
         elif key == ord("r"):
-            self.state.queue_teleport(-1)
+            if self.accept_key("r"):
+                self.state.queue_teleport(-1)
         elif key in (ord("t"), ord("T")):
-            self.state.queue_manual_teleport()
+            if self.accept_key("t"):
+                self.state.queue_manual_teleport()
         elif key in (ord("q"), 27):
             self.state.request_stop()
             self.running = False
+
+    def accept_key(self, key_name: str) -> bool:
+        now = time.monotonic()
+        last = self.last_key_at.get(key_name, 0.0)
+        if now - last < self.key_debounce_sec:
+            return False
+        self.last_key_at[key_name] = now
+        return True
 
     @staticmethod
     def ensure_bgr(cv2, frame):
@@ -337,13 +602,80 @@ class OffshorePreview:
         lines = [
             f"Target: {target.label}  {distance:.1f} m",
             f"NED: x={position[0]:.1f} y={position[1]:.1f} z={position[2]:.1f}",
-            f"Heading: {snapshot['heading_deg']:.1f} deg  Mode: teleport only",
-            "e next | r previous | t custom x,y,z,angle | q/esc quit",
+            f"Heading: {snapshot['heading_deg']:.1f} deg  Mode: auto diagnostic",
+            "automatic route | q/esc quit",
         ]
         y = frame.shape[0] - 92
         for line in lines:
             self.draw_text(cv2, frame, line, (18, y), scale=0.55)
             y += 22
+
+    def draw_diagnostics(self, cv2, frame):
+        snapshot = self.state.snapshot()
+        diagnostics = snapshot["diagnostics"]
+        panel_x = 18
+        panel_y = 385
+        panel_w = 620
+        row_h = 20
+        rows = [
+            (
+                "Requested",
+                snapshot["last_requested_position"],
+                snapshot["last_requested_yaw_deg"],
+                snapshot["last_requested_label"],
+            )
+        ]
+        for name in (
+            "AirSim GT kin",
+            "AirSim GT pose",
+            "World object pose",
+            "PX4 estimated kin",
+            "Actual pose topic",
+            "FPV camera msg",
+            "Chase camera msg",
+            "FPV get_images",
+            "Chase get_images",
+        ):
+            item = diagnostics.get(name, {})
+            rows.append(
+                (
+                    name,
+                    item.get("position"),
+                    item.get("yaw_deg"),
+                    item.get("extra", ""),
+                )
+            )
+
+        panel_h = 36 + row_h * len(rows)
+        overlay = frame.copy()
+        cv2.rectangle(
+            overlay,
+            (panel_x - 10, panel_y - 24),
+            (panel_x + panel_w, panel_y + panel_h),
+            (18, 18, 18),
+            -1,
+        )
+        cv2.addWeighted(overlay, 0.58, frame, 0.42, 0.0, frame)
+        cv2.rectangle(
+            frame,
+            (panel_x - 10, panel_y - 24),
+            (panel_x + panel_w, panel_y + panel_h),
+            (235, 235, 235),
+            1,
+        )
+        self.draw_text(
+            cv2,
+            frame,
+            "Coordinate Diagnostics          x        y        z      yaw",
+            (panel_x, panel_y - 4),
+            scale=0.48,
+        )
+        y = panel_y + 18
+        for name, position, yaw_deg, extra in rows:
+            yaw_text = "n/a" if yaw_deg is None else f"{yaw_deg:6.1f}"
+            line = f"{name[:18]:18s} {vector_or_none(position)} {yaw_text:>6s}  {extra[:18]}"
+            self.draw_text(cv2, frame, line, (panel_x, y), scale=0.46)
+            y += row_h
 
     @staticmethod
     def draw_text(cv2, frame, text: str, origin: Tuple[int, int], scale: float = 0.6):
@@ -610,15 +942,197 @@ def route_from_constants() -> List[RoutePoint]:
 
 
 def drain_teleport_request(state: DemoState) -> Optional[int]:
-    delta_total = 0
+    delta = None
     while not state.teleport_requests.empty():
-        delta_total += state.teleport_requests.get()
-    if delta_total == 0:
+        if delta is None:
+            delta = state.teleport_requests.get()
+        else:
+            state.teleport_requests.get()
+    return delta
+
+
+def nearest_route_index(route: Sequence[RoutePoint], position: Sequence[float]) -> int:
+    best_index = 0
+    best_distance = float("inf")
+    for index, point in enumerate(route):
+        distance = distance_between(position, point.position)
+        if distance < best_distance:
+            best_index = index
+            best_distance = distance
+    return best_index
+
+
+def update_pose_topic_diagnostic(state: DemoState, pose_msg):
+    state.update_diagnostic(
+        "Actual pose topic",
+        extract_pose_position(pose_msg),
+        extract_pose_yaw_deg(pose_msg),
+        "topic",
+    )
+
+
+def safe_call(label: str, fn):
+    try:
+        return fn()
+    except Exception as exc:
+        if label not in WARNED_UNAVAILABLE:
+            projectairsim_log().warning("%s unavailable: %s", label, exc)
+            WARNED_UNAVAILABLE.add(label)
         return None
 
-    snapshot = state.snapshot()
-    route_len = len(state.route)
-    return (snapshot["current_index"] + delta_total) % route_len
+
+def update_drone_diagnostics(
+    drone: Drone,
+    state: DemoState,
+    world: Optional[World] = None,
+    object_name: Optional[str] = None,
+):
+    gt_kin = safe_call("AirSim ground-truth kinematics", drone.get_ground_truth_kinematics)
+    if gt_kin is not None:
+        state.update_diagnostic(
+            "AirSim GT kin",
+            extract_pose_position(gt_kin),
+            extract_pose_yaw_deg(gt_kin),
+            "GetGroundTruthKinematics",
+        )
+
+    gt_pose = safe_call("AirSim ground-truth pose", drone.get_ground_truth_pose)
+    if gt_pose is not None:
+        state.update_diagnostic(
+            "AirSim GT pose",
+            extract_pose_position(gt_pose),
+            extract_pose_yaw_deg(gt_pose),
+            "GetGroundTruthPose",
+        )
+
+    if world is not None and object_name:
+        object_poses = safe_call(
+            f"World get_object_poses {object_name}",
+            lambda: world.get_object_poses([object_name]),
+        )
+        if object_poses:
+            state.update_diagnostic(
+                "World object pose",
+                extract_pose_position(object_poses[0]),
+                extract_pose_yaw_deg(object_poses[0]),
+                f"GetObjectPoses {object_name}",
+            )
+
+    est_kin = safe_call("PX4 estimated kinematics", drone.get_estimated_kinematics)
+    if est_kin is not None:
+        state.update_diagnostic(
+            "PX4 estimated kin",
+            extract_pose_position(est_kin),
+            extract_pose_yaw_deg(est_kin),
+            "GetEstimatedKinematics",
+        )
+
+    gt_geo = safe_call("AirSim ground-truth geo", drone.get_ground_truth_geo_location)
+    if gt_geo is not None:
+        state.update_diagnostic("AirSim GT geo", None, None, geo_summary(gt_geo))
+
+    est_geo = safe_call("PX4 estimated geo", drone.get_estimated_geo_location)
+    if est_geo is not None:
+        state.update_diagnostic("PX4 estimated geo", None, None, geo_summary(est_geo))
+
+    if "GPS" in drone.sensors and "gps" in drone.sensors["GPS"]:
+        gps = safe_call("GPS sensor", lambda: drone.get_gps_data("GPS"))
+        if gps is not None:
+            state.update_diagnostic("GPS sensor", None, None, geo_summary(gps))
+
+
+def update_requested_camera_diagnostics(drone: Drone, state: DemoState, args):
+    for camera_id, label in (
+        (args.fpv_camera, "FPV get_images"),
+        (args.chase_camera, "Chase get_images"),
+    ):
+        images = safe_call(
+            f"{camera_id} GetImages",
+            lambda camera_id=camera_id: drone.get_images(
+                camera_id,
+                [ImageType.SCENE],
+            ),
+        )
+        if not images:
+            continue
+
+        image = images.get(ImageType.SCENE) or images.get(int(ImageType.SCENE))
+        if image is None:
+            continue
+
+        position = image_pose_position(image)
+        yaw_deg = image_pose_yaw_deg(image)
+        extra = "GetImages"
+        if position is not None:
+            offset_m = distance_between(position, state.snapshot()["position"])
+            extra = f"GetImages offset={offset_m:.1f}m"
+        state.update_diagnostic(label, position, yaw_deg, extra)
+
+
+def reset_camera_renderers(drone: Drone, camera_ids: Sequence[str]):
+    for camera_id in camera_ids:
+        safe_call(
+            f"Reset camera {camera_id}",
+            lambda camera_id=camera_id: drone.reset_camera_pose(
+                camera_id,
+                wait_for_pose_update=True,
+            ),
+        )
+
+
+def diagnostics_lines(snapshot: Dict) -> List[str]:
+    diagnostics = snapshot["diagnostics"]
+    rows = [
+        (
+            "Requested",
+            snapshot["last_requested_position"],
+            snapshot["last_requested_yaw_deg"],
+            snapshot["last_requested_label"],
+        )
+    ]
+    for name in (
+        "AirSim GT kin",
+        "AirSim GT pose",
+        "World object pose",
+        "PX4 estimated kin",
+        "Actual pose topic",
+        "FPV camera msg",
+        "Chase camera msg",
+        "FPV get_images",
+        "Chase get_images",
+    ):
+        item = diagnostics.get(name, {})
+        rows.append((name, item.get("position"), item.get("yaw_deg"), item.get("extra", "")))
+
+    lines = [
+        "",
+        "Coordinate diagnostics",
+        "source                x        y        z      yaw    note",
+        "---------------------------------------------------------------",
+    ]
+    for name, position, yaw_deg, extra in rows:
+        yaw_text = "   n/a" if yaw_deg is None else f"{yaw_deg:6.1f}"
+        lines.append(
+            f"{name[:18]:18s} {vector_or_none(position)} {yaw_text}  {extra}"
+        )
+    for name in ("AirSim GT geo", "PX4 estimated geo", "GPS sensor"):
+        extra = diagnostics.get(name, {}).get("extra")
+        if extra:
+            lines.append(f"{name[:18]:18s} {extra}")
+    return lines
+
+
+def log_diagnostics(snapshot: Dict):
+    for line in diagnostics_lines(snapshot):
+        projectairsim_log().info(line)
+
+
+def log_mission_snapshot(label: str, index: int, snapshot: Dict):
+    projectairsim_log().info("")
+    projectairsim_log().info("=" * 72)
+    projectairsim_log().info("Mission snapshot %02d: %s", index, label)
+    projectairsim_log().info("=" * 72)
+    log_diagnostics(snapshot)
 
 
 def drain_manual_teleport_request(state: DemoState) -> bool:
@@ -639,28 +1153,65 @@ def parse_manual_teleport(value: str) -> RoutePoint:
     return RoutePoint("Custom", numbers[:3], numbers[3])
 
 
-async def apply_teleport(drone: Drone, state: DemoState, index: int):
+def sync_world_object_pose(world: Optional[World], object_name: str, pose: Pose):
+    if world is None:
+        return
+    safe_call(
+        f"World set_object_pose {object_name}",
+        lambda: world.set_object_pose(object_name, pose, teleport=True),
+    )
+
+
+async def apply_teleport(
+    drone: Drone,
+    state: DemoState,
+    index: int,
+    args,
+    world: Optional[World] = None,
+):
     point = state.route[index]
     drone.cancel_last_task()
     target_ned = route_to_ned(point.position)
-    drone.set_pose(make_pose_ned_yaw(target_ned, point.yaw_deg), reset_kinematics=True)
+    state.update_requested(point.label, target_ned, point.yaw_deg)
+    state.bump_camera_epoch()
+    pose = make_pose_ned_yaw(target_ned, point.yaw_deg)
+    drone.set_pose(pose, reset_kinematics=True)
+    sync_world_object_pose(world, args.drone_name, pose)
+    reset_camera_renderers(drone, [args.fpv_camera, args.chase_camera])
     await asyncio.sleep(0.1)
+    update_drone_diagnostics(drone, state, world, args.drone_name)
     actual_ned = get_pose_position_ned(drone)
     actual_route = ned_to_route(actual_ned)
     state.update_pose(actual_route, point.yaw_deg)
+    error_m = distance_between(actual_route, point.position)
     with state.lock:
         state.current_index = index
         state.target_index = min(index + 1, len(state.route) - 1)
     projectairsim_log().info(
-        "Teleported to %s NED requested=%s actual=%s heading=%.1f deg",
+        "Teleported to %s index=%d NED requested=%s actual=%s error=%.2fm heading=%.1f deg",
         point.label,
+        index,
         format_vector3(target_ned),
         format_vector3(actual_ned),
+        error_m,
         point.yaw_deg % 360.0,
     )
+    if error_m > TELEPORT_WARN_ERROR_M:
+        projectairsim_log().warning(
+            "Teleport landed %.2fm from requested %s. This usually means the "
+            "sim adjusted the pose because of collision/terrain, or PX4/physics "
+            "moved the vehicle immediately after SetPose.",
+            error_m,
+            point.label,
+        )
 
 
-async def prompt_manual_teleport(drone: Drone, state: DemoState):
+async def prompt_manual_teleport(
+    drone: Drone,
+    state: DemoState,
+    args,
+    world: Optional[World] = None,
+):
     value = (
         await asyncio.to_thread(
             input,
@@ -679,8 +1230,14 @@ async def prompt_manual_teleport(drone: Drone, state: DemoState):
 
     target_ned = route_to_ned(point.position)
     drone.cancel_last_task()
-    drone.set_pose(make_pose_ned_yaw(target_ned, point.yaw_deg), reset_kinematics=True)
+    state.update_requested(point.label, target_ned, point.yaw_deg)
+    state.bump_camera_epoch()
+    pose = make_pose_ned_yaw(target_ned, point.yaw_deg)
+    drone.set_pose(pose, reset_kinematics=True)
+    sync_world_object_pose(world, args.drone_name, pose)
+    reset_camera_renderers(drone, [args.fpv_camera, args.chase_camera])
     await asyncio.sleep(0.1)
+    update_drone_diagnostics(drone, state, world, args.drone_name)
     actual_ned = get_pose_position_ned(drone)
     actual_route = ned_to_route(actual_ned)
     state.update_pose(actual_route, point.yaw_deg)
@@ -692,30 +1249,113 @@ async def prompt_manual_teleport(drone: Drone, state: DemoState):
     )
 
 
-async def run_teleport_viewer(drone: Drone, state: DemoState, args):
-    await apply_teleport(drone, state, 0)
-    projectairsim_log().info("Teleport-only mode active. Press e/r/t in the preview.")
-    last_report_at = 0.0
-
-    while not state.snapshot()["stop_requested"]:
-        teleport_index = drain_teleport_request(state)
-        if teleport_index is not None:
-            await apply_teleport(drone, state, teleport_index)
-        if drain_manual_teleport_request(state):
-            await prompt_manual_teleport(drone, state)
-
+async def settle_and_sample(
+    drone: Drone,
+    state: DemoState,
+    duration_sec: float,
+    world: Optional[World] = None,
+    object_name: Optional[str] = None,
+):
+    settle_until = time.time() + max(0.0, duration_sec)
+    while time.time() < settle_until and not state.snapshot()["stop_requested"]:
         current_ned = get_pose_position_ned(drone)
         current = ned_to_route(current_ned)
         current_heading = heading_deg_360(get_pose_yaw_ned(drone))
         state.update_pose(current, current_heading)
+        state.set_route_index(nearest_route_index(state.route, current))
+        update_drone_diagnostics(drone, state, world, object_name)
+        await asyncio.sleep(0.25)
+
+    update_drone_diagnostics(drone, state, world, object_name)
+
+
+async def run_auto_diagnostic_mission(
+    drone: Drone,
+    state: DemoState,
+    args,
+    world: Optional[World] = None,
+):
+    projectairsim_log().info(
+        "Automatic diagnostic mission: %d route points, %.1fs wait at each point",
+        len(state.route),
+        args.auto_wait_sec,
+    )
+
+    for index, point in enumerate(state.route):
+        if state.snapshot()["stop_requested"]:
+            break
+
+        await apply_teleport(drone, state, index, args, world)
+        await settle_and_sample(drone, state, args.auto_wait_sec, world, args.drone_name)
+        update_requested_camera_diagnostics(drone, state, args)
+        log_mission_snapshot(point.label, index, state.snapshot())
+
+    projectairsim_log().info("")
+    projectairsim_log().info("Automatic diagnostic mission complete.")
+
+    if args.hold_open_after_mission:
+        projectairsim_log().info("Holding preview open. Press q/esc in preview or Ctrl+C.")
+        while not state.snapshot()["stop_requested"]:
+            await settle_and_sample(drone, state, 0.5, world, args.drone_name)
+    else:
+        state.request_stop()
+
+
+async def run_teleport_viewer(
+    drone: Drone,
+    state: DemoState,
+    args,
+    world: Optional[World] = None,
+):
+    initial_ned = get_pose_position_ned(drone)
+    initial_route = ned_to_route(initial_ned)
+    initial_index = nearest_route_index(state.route, initial_route)
+    state.set_route_index(initial_index)
+    state.update_pose(initial_route, heading_deg_360(get_pose_yaw_ned(drone)))
+    update_drone_diagnostics(drone, state, world, args.drone_name)
+    projectairsim_log().info("Teleport-only mode active. Press e/r/t in the preview.")
+    last_report_at = 0.0
+    last_diagnostics_at = 0.0
+
+    while not state.snapshot()["stop_requested"]:
+        current_ned = get_pose_position_ned(drone)
+        current = ned_to_route(current_ned)
+        current_heading = heading_deg_360(get_pose_yaw_ned(drone))
+        state.update_pose(current, current_heading)
+        state.set_route_index(nearest_route_index(state.route, current))
 
         now = time.time()
+        if now - last_diagnostics_at >= 0.5:
+            update_drone_diagnostics(drone, state, world, args.drone_name)
+            last_diagnostics_at = now
+
+        direction = drain_teleport_request(state)
+        if direction is not None:
+            base_index = nearest_route_index(state.route, current)
+            target_index = (base_index + direction) % len(state.route)
+            projectairsim_log().info(
+                "Route key %s from nearest %s index=%d to %s index=%d",
+                "next" if direction > 0 else "previous",
+                state.route[base_index].label,
+                base_index,
+                state.route[target_index].label,
+                target_index,
+            )
+            await apply_teleport(drone, state, target_index, args, world)
+            current_ned = get_pose_position_ned(drone)
+            current = ned_to_route(current_ned)
+            current_heading = heading_deg_360(get_pose_yaw_ned(drone))
+            state.update_pose(current, current_heading)
+        if drain_manual_teleport_request(state):
+            await prompt_manual_teleport(drone, state, args, world)
+
         if now - last_report_at >= args.pose_report_interval_sec:
             projectairsim_log().info(
                 "Teleport viewer NED %s heading %.1f deg",
                 format_vector3(current),
                 current_heading,
             )
+            log_diagnostics(state.snapshot())
             last_report_at = now
 
         await asyncio.sleep(0.05)
@@ -774,8 +1414,12 @@ async def run_demo(args):
         preview.start()
         client.subscribe(fpv_topic, preview.receive_fpv)
         client.subscribe(chase_topic, preview.receive_chase)
+        client.subscribe(
+            drone.robot_info["actual_pose"],
+            lambda _, pose_msg: update_pose_topic_diagnostic(state, pose_msg),
+        )
         projectairsim_log().info(
-            "Preview opened. Controls: e next, r previous, t custom teleport, q/esc quit"
+            "Preview opened. Automatic diagnostic mission will run; q/esc quits."
         )
 
         await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
@@ -787,7 +1431,7 @@ async def run_demo(args):
             format_vector3(initial_pose_route),
         )
 
-        await run_teleport_viewer(drone, state, args)
+        await run_auto_diagnostic_mission(drone, state, args, world)
     finally:
         state.request_stop()
         preview.stop()
@@ -818,7 +1462,17 @@ def build_parser():
     parser.add_argument("--topics-port", type=int, default=8989)
     parser.add_argument("--services-port", type=int, default=8990)
     parser.add_argument("--load-delay-sec", type=float, default=2.0)
-    parser.add_argument("--pose-report-interval-sec", type=float, default=2.0)
+    parser.add_argument(
+        "--auto-wait-sec",
+        type=float,
+        default=5.0,
+        help="Seconds to wait after each automatic teleport before logging diagnostics.",
+    )
+    parser.add_argument(
+        "--hold-open-after-mission",
+        action="store_true",
+        help="Keep the preview open after the automatic diagnostic route completes.",
+    )
     parser.add_argument("--px4-ready-timeout-sec", type=float, default=300.0)
     parser.add_argument("--fpv-camera", default="FrontCamera")
     parser.add_argument("--chase-camera", default="Chase")
