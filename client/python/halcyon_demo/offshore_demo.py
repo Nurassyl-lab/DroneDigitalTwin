@@ -4,7 +4,8 @@ Offshore wind farm PX4 demo.
 Run this while the OffShoreWindFarm Unreal map is playing. The script loads a
 PX4 scene, spawns Drone1 at OFFSHORE_ROUTE[0], and shows FPV with a
 chase-camera picture-in-picture. E/R teleport between the route points. Use
---mode-flight auto-flight to teleport to Origin and start PX4 route flight.
+--mode-flight auto-flight to teleport to Origin and fly OFFSHORE_ROUTE exactly
+as listed.
 
 Controls in the OpenCV preview:
   e  teleport to next route point
@@ -298,6 +299,20 @@ def extract_pose_yaw_deg(pose_or_kinematics) -> Optional[float]:
     if not isinstance(pose, dict):
         return None
     return rotation_yaw_deg(pose.get("orientation") or pose.get("rotation"))
+
+
+def vector_length(values: Sequence[float]) -> float:
+    return math.sqrt(sum(float(value) * float(value) for value in values))
+
+
+def get_ground_truth_velocity_ned(drone: Drone) -> List[float]:
+    twist = drone.get_ground_truth_kinematics().get("twist", {})
+    linear = twist.get("linear", {})
+    return [
+        float(linear.get("x", 0.0)),
+        float(linear.get("y", 0.0)),
+        float(linear.get("z", 0.0)),
+    ]
 
 
 def image_pose_position(image) -> Optional[List[float]]:
@@ -1014,6 +1029,34 @@ def ensure_camera(
     ensure_scene_camera_capture(sensor, width, height, fov_degrees, capture_interval_sec)
 
 
+def ensure_px4_route_speed_params(robot_config: Dict, args):
+    controller = robot_config.get("controller", {})
+    if controller.get("type") != "px4-api":
+        return
+
+    px4_settings = controller.setdefault("px4-settings", {})
+    parameters = px4_settings.setdefault("parameters", {})
+    xy_speed_mps = max(0.1, float(args.route_speed_mps))
+    configured_vertical_speed_mps = float(args.route_vertical_speed_mps)
+    vertical_speed_mps = max(
+        0.1,
+        configured_vertical_speed_mps if configured_vertical_speed_mps > 0.0 else xy_speed_mps,
+    )
+    parameters.update(
+        {
+            "MPC_VEL_MANUAL": xy_speed_mps,
+            "MPC_XY_CRUISE": xy_speed_mps,
+            "MPC_XY_VEL_MAX": xy_speed_mps,
+            "MPC_Z_VEL_MAX_DN": vertical_speed_mps,
+        }
+    )
+    projectairsim_log().info(
+        "Runtime config set PX4 route speed params: xy=%.1f m/s vertical-down=%.1f m/s",
+        xy_speed_mps,
+        vertical_speed_mps,
+    )
+
+
 def make_runtime_scene_config(args, route: Sequence[RoutePoint]):
     scene_path = resolve_config_path(args.scene, args.sim_config_path)
     if not scene_path.exists():
@@ -1069,6 +1112,7 @@ def make_runtime_scene_config(args, route: Sequence[RoutePoint]):
                     args.camera_fov_degrees,
                     args.camera_capture_interval_sec,
                 )
+                ensure_px4_route_speed_params(robot_config, args)
 
             suffix = robot_config_path.suffix or ".jsonc"
             output_name = f"{robot_config_path.stem}_{actor_index}_offshore{suffix}"
@@ -1909,12 +1953,16 @@ async def fly_route_segment_smooth(
             )
 
         if elapsed - last_report_at >= args.pose_report_interval_sec:
+            actual_velocity = get_ground_truth_velocity_ned(drone)
             projectairsim_log().info(
-                "%s following segment to %s; pose NED %s; remaining %.2f m",
+                "%s following segment to %s; pose NED %s; remaining %.2f m; "
+                "commanded %.2f m/s actual %.2f m/s",
                 label,
                 format_vector3(target),
                 format_vector3(current),
                 distance,
+                vector_length(velocity),
+                vector_length(actual_velocity),
             )
             update_drone_diagnostics(drone, state, world, args.drone_name)
             last_report_at = elapsed
@@ -2425,7 +2473,15 @@ async def run_demo(args):
             )
 
         if mode_flight == "auto-flight":
-            route = plan_obstacle_aware_route(world, args, route)
+            if args.replan_on_object:
+                projectairsim_log().warning(
+                    "--replan-on-object is ignored in offshore_demo; "
+                    "auto-flight uses OFFSHORE_ROUTE exactly as listed."
+                )
+            projectairsim_log().info(
+                "Obstacle avoidance disabled; using %d OFFSHORE_ROUTE points unchanged",
+                len(route),
+            )
 
         state = DemoState(route)
         preview = OffshorePreview(
@@ -2507,18 +2563,18 @@ def build_parser():
         default="teleport",
         help="Startup mode: manual teleport viewer, immediate PX4 route flight, or teleport diagnostics.",
     )
-    parser.set_defaults(replan_on_object=True)
+    parser.set_defaults(replan_on_object=False)
     parser.add_argument(
         "--replan-on-object",
         dest="replan_on_object",
         action="store_true",
-        help="Before auto flight, scan route legs and add obstacle bypasses.",
+        help="Legacy no-op. Auto-flight now uses OFFSHORE_ROUTE exactly as listed.",
     )
     parser.add_argument(
         "--no-replan-on-object",
         dest="replan_on_object",
         action="store_false",
-        help="Disable obstacle-aware route expansion before auto flight.",
+        help="Legacy no-op. Auto-flight already uses OFFSHORE_ROUTE unchanged.",
     )
     parser.add_argument(
         "--log-obstacle-scans",
@@ -2685,7 +2741,7 @@ def build_parser():
     parser.add_argument(
         "--route-timeout-multiplier",
         type=float,
-        default=3.0,
+        default=10.0,
         help="Multiplier for inferred per-leg timeout when route move timeout is 0.",
     )
     parser.add_argument(
