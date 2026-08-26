@@ -78,6 +78,21 @@ from route_replan_static import (  # noqa: E402
 #     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
 #     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
 # ]
+# OFFSHORE_ROUTE = [
+#     ("Origin", [0.0, 148.0, -2.0], 270.0),
+#     ("Around waypoint 1", [12.85,-11.4,-115], 127.6),
+#     ("Waypoint 1", [1.28, -14.66, -115.16], 127.6),
+#     ("Around waypoint 2", [881.6,17,-113], 324.3),
+#     ("Waypoint 2", [893.69, 7.89, -112.77], 324.3),
+#     ("Around waypoint 3", [895,-870,-20], 279.5),
+#     ("Waypoint 3", [899.44, -892.28, -12.28], 279.5),
+#     ("Around waypoint 4", [21,-908,-111], 55.2),
+#     ("Waypoint 4", [6.35, -910.1, -117.81], 55.2),
+#     ("Around waypoint 5", [-870, -901.37, -20], 159.9),
+#     ("Waypoint 5", [-894.61, -901.37, -114.0], 159.9),
+#     ("Around waypoint 6", [-890, -11, -12.82], 111.0),
+#     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
+#     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
 OFFSHORE_ROUTE = [
     ("Origin", [0.0, 148.0, -2.0], 270.0),
     ("Around waypoint 1", [12.85,-11.4,-115], 127.6),
@@ -86,10 +101,10 @@ OFFSHORE_ROUTE = [
     ("Waypoint 2", [893.69, 7.89, -112.77], 324.3),
     ("Around waypoint 3", [895,-870,-20], 279.5),
     ("Waypoint 3", [899.44, -892.28, -12.28], 279.5),
-    ("Around waypoint 4", [21,-908,-111], 55.2),
-    ("Waypoint 4", [-3.35, -907.1, -114.81], 55.2),
-    ("Around waypoint 5", [-870, -901.37, -20], 159.9),
-    ("Waypoint 5", [-894.61, -901.37, -114.0], 159.9),
+    ("Around waypoint 4", [21, -908.0, -111.0], 90.0),
+    ("Waypoint 4", [6.35, -910.1, -117.81], 55.2),
+    ("Around waypoint 5", [-880, -895, -16], 180.0),
+    ("Waypoint 5", [-892, -902, -12.0], 164),
     ("Around waypoint 6", [-890, -11, -12.82], 111.0),
     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
@@ -508,6 +523,8 @@ class OffshorePreview:
         self.video_writer = None
         self.video_path = None
         self.video_frame_count = 0
+        self.video_started_at = None
+        self.video_last_frame_at = None
         self.video_finalized = False
         self.fpv_images = queue.SimpleQueue()
         self.chase_images = queue.SimpleQueue()
@@ -570,8 +587,15 @@ class OffshorePreview:
         if not self.record_video:
             return
         self.ensure_video_writer(cv2)
-        self.video_writer.write(frame)
-        self.video_frame_count += 1
+        now = time.monotonic()
+        if self.video_started_at is None:
+            self.video_started_at = now
+
+        target_frame_count = int((now - self.video_started_at) * self.video_fps) + 1
+        while self.video_frame_count < target_frame_count:
+            self.video_writer.write(frame)
+            self.video_frame_count += 1
+        self.video_last_frame_at = now
 
     def close_video_writer(self):
         if self.video_finalized:
@@ -579,10 +603,14 @@ class OffshorePreview:
         if self.video_writer is not None:
             self.video_writer.release()
             self.video_writer = None
+            duration_sec = 0.0
+            if self.video_started_at is not None and self.video_last_frame_at is not None:
+                duration_sec = max(0.0, self.video_last_frame_at - self.video_started_at)
             projectairsim_log().info(
-                "Saved preview video to %s (%d frames)",
+                "Saved preview video to %s (%d frames, %.1fs)",
                 self.video_path,
                 self.video_frame_count,
+                duration_sec,
             )
         elif self.record_video and self.video_path is None:
             projectairsim_log().warning("Video requested, but no preview frames were recorded.")

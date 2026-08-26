@@ -11,7 +11,7 @@ python px4_astar_autopilot.py `
   --keyboard-speed-step-mps 20 `
   --keyboard-yaw-rate-dps 60 `
   --wind-speed-mps 15 `
-  --wind-direction-deg 90 `
+  --wind-direction-deg 90
 ```
 *max speed might be unbounded*
 
