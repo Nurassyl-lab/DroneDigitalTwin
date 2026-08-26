@@ -5,7 +5,7 @@ Run this while the OffShoreWindFarm Unreal map is playing. The script loads a
 PX4 scene, spawns Drone1 at OFFSHORE_ROUTE[0], and shows FPV with a
 chase-camera picture-in-picture. E/R teleport between the route points. Use
 --mode-flight auto-flight to teleport to Origin and fly OFFSHORE_ROUTE exactly
-as listed.
+as listed. Add --video to record the preview window to client/python/halcyon_demo/video.
 
 Controls in the OpenCV preview:
   e  teleport to next route point
@@ -38,6 +38,7 @@ from projectairsim.utils import projectairsim_log, unpack_image
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+VIDEO_DIR = SCRIPT_DIR / "video"
 EXAMPLE_SCRIPTS_DIR = SCRIPT_DIR.parent / "example_user_scripts"
 if str(EXAMPLE_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLE_SCRIPTS_DIR))
@@ -491,6 +492,9 @@ class OffshorePreview:
         height: int,
         pip_scale: float,
         max_fps: float,
+        record_video: bool = False,
+        video_dir: Optional[Path] = None,
+        video_fps: float = 0.0,
     ):
         self.state = state
         self.window_name = window_name
@@ -498,6 +502,13 @@ class OffshorePreview:
         self.height = height
         self.pip_scale = max(0.1, min(0.5, pip_scale))
         self.max_fps = max(1.0, max_fps)
+        self.record_video = bool(record_video)
+        self.video_dir = Path(video_dir) if video_dir is not None else VIDEO_DIR
+        self.video_fps = self.max_fps if video_fps <= 0.0 else max(1.0, video_fps)
+        self.video_writer = None
+        self.video_path = None
+        self.video_frame_count = 0
+        self.video_finalized = False
         self.fpv_images = queue.SimpleQueue()
         self.chase_images = queue.SimpleQueue()
         self.running = False
@@ -526,7 +537,57 @@ class OffshorePreview:
         self.running = False
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=2.0)
+        if not self.thread or not self.thread.is_alive():
+            self.close_video_writer()
         self.thread = None
+
+    def ensure_video_writer(self, cv2):
+        if not self.record_video or self.video_writer is not None:
+            return
+
+        self.video_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.video_path = self.video_dir / f"offshore_demo_{timestamp}.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(
+            str(self.video_path),
+            fourcc,
+            self.video_fps,
+            (self.width, self.height),
+        )
+        if not writer.isOpened():
+            writer.release()
+            raise RuntimeError(f"Could not open video writer: {self.video_path}")
+
+        self.video_writer = writer
+        projectairsim_log().info(
+            "Recording preview video to %s at %.1f FPS",
+            self.video_path,
+            self.video_fps,
+        )
+
+    def write_video_frame(self, cv2, frame):
+        if not self.record_video:
+            return
+        self.ensure_video_writer(cv2)
+        self.video_writer.write(frame)
+        self.video_frame_count += 1
+
+    def close_video_writer(self):
+        if self.video_finalized:
+            return
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+            projectairsim_log().info(
+                "Saved preview video to %s (%d frames)",
+                self.video_path,
+                self.video_frame_count,
+            )
+        elif self.record_video and self.video_path is None:
+            projectairsim_log().warning("Video requested, but no preview frames were recorded.")
+        if self.record_video:
+            self.video_finalized = True
 
     def receive_fpv(self, _, image):
         self.state.update_image_diagnostic("FPV camera msg", image)
@@ -639,9 +700,11 @@ class OffshorePreview:
                                 flags=cv2.WINDOW_GUI_NORMAL + cv2.WINDOW_AUTOSIZE,
                             )
                             created = True
+                        self.write_video_frame(cv2, frame)
                         cv2.imshow(self.window_name, frame)
                     key = cv2.waitKey(1)
                     self.handle_key(key)
+                    next_frame_at = time.monotonic() + frame_interval_sec
                     continue
 
                 frame = fpv
@@ -664,6 +727,7 @@ class OffshorePreview:
                     )
                     created = True
 
+                self.write_video_frame(cv2, frame)
                 cv2.imshow(self.window_name, frame)
                 self.handle_key(cv2.waitKey(1))
                 next_frame_at = time.monotonic() + frame_interval_sec
@@ -671,6 +735,7 @@ class OffshorePreview:
             self.error = exc
             self.state.request_stop()
         finally:
+            self.close_video_writer()
             if created:
                 cv2.destroyWindow(self.window_name)
 
@@ -2325,6 +2390,8 @@ async def run_route_auto_flight(
                 )
 
         projectairsim_log().info("Auto flight complete")
+        state.set_mode("auto flight complete", "mission complete")
+        state.request_stop()
     except asyncio.CancelledError:
         projectairsim_log().info("Auto flight cancelled")
         cancel_last_task_safely(drone)
@@ -2535,6 +2602,9 @@ async def run_demo(args):
             args.preview_height,
             args.pip_scale,
             args.preview_fps,
+            args.video,
+            Path(args.video_dir),
+            args.video_fps,
         )
         preview.start()
         client.subscribe(fpv_topic, preview.receive_fpv)
@@ -2961,6 +3031,22 @@ def build_parser():
     parser.add_argument("--preview-height", type=int, default=720)
     parser.add_argument("--preview-fps", type=float, default=30.0)
     parser.add_argument("--pip-scale", type=float, default=0.30)
+    parser.add_argument(
+        "--video",
+        action="store_true",
+        help="Record the OpenCV preview and save it when q/esc is pressed or auto-flight completes.",
+    )
+    parser.add_argument(
+        "--video-dir",
+        default=str(VIDEO_DIR),
+        help="Directory for --video recordings.",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=float,
+        default=0.0,
+        help="Video FPS for --video. Use 0 to match --preview-fps.",
+    )
     return parser
 
 
