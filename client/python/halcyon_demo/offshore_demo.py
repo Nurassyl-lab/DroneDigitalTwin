@@ -980,8 +980,36 @@ class OffshorePreview:
         line_spacing = 18
         y = frame.shape[0] - (line_spacing * len(lines) + 4)
         for line in lines:
-            self.draw_text(cv2, frame, line, (18, y), scale=0.50)
+            is_wind_line = line.startswith("WIND ")
+            if is_wind_line and snapshot.get("wind_sample") is not None:
+                self.draw_wind_arrow(cv2, frame, snapshot, (42, y - 7), 15)
+                text_x = 68
+            else:
+                text_x = 18
+            self.draw_text(cv2, frame, line, (text_x, y), scale=0.50)
             y += line_spacing
+
+    def draw_wind_arrow(self, cv2, frame, snapshot: Dict, center: Tuple[int, int], radius: int):
+        wind_sample = snapshot["wind_sample"]
+        if wind_sample is None or wind_sample.horizontal_speed_mps <= 1e-6:
+            return
+
+        # Arrow is relative to the drone/camera: up=forward, right=drone right.
+        relative_deg = (wind_sample.direction_to_deg - snapshot["heading_deg"]) % 360.0
+        relative_rad = math.radians(relative_deg)
+        dx = math.sin(relative_rad)
+        dy = -math.cos(relative_rad)
+        start = (
+            int(center[0] - dx * radius * 0.45),
+            int(center[1] - dy * radius * 0.45),
+        )
+        end = (
+            int(center[0] + dx * radius * 0.90),
+            int(center[1] + dy * radius * 0.90),
+        )
+        blue = (255, 190, 60)
+        cv2.circle(frame, center, radius, blue, 1, cv2.LINE_AA)
+        cv2.arrowedLine(frame, start, end, blue, 2, cv2.LINE_AA, tipLength=0.35)
 
     def draw_battery(self, cv2, frame):
         snapshot = self.state.snapshot()
