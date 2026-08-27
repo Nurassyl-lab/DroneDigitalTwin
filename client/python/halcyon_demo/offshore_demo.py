@@ -396,8 +396,9 @@ def geo_summary(value) -> str:
 
 
 class DemoState:
-    def __init__(self, route: Sequence[RoutePoint]):
+    def __init__(self, route: Sequence[RoutePoint], battery_start_percent: float = 100.0):
         self.route = list(route)
+        self.battery_start_percent = clamp(float(battery_start_percent), 0.0, 100.0)
         self.current_index = 0
         self.target_index = 1
         self.position = list(self.route[0].position)
@@ -411,7 +412,7 @@ class DemoState:
         self.auto_flight_running = False
         self.camera_epoch = 0
         self.battery_started_at = None
-        self.battery_percent = 100.0
+        self.battery_percent = self.battery_start_percent
         self.coverage_unfeasible = False
         self.coverage_unfeasible_logged = False
         self.wind_enabled = False
@@ -449,11 +450,11 @@ class DemoState:
 
     def _battery_percent_locked(self, now: Optional[float] = None) -> float:
         if self.battery_started_at is None:
-            return 100.0
+            return self.battery_start_percent
         now = time.time() if now is None else now
         elapsed_sec = max(0.0, now - self.battery_started_at)
         depleted_percent = int(elapsed_sec // BATTERY_SECONDS_PER_PERCENT)
-        return float(clamp(100.0 - depleted_percent, 0.0, 100.0))
+        return float(clamp(self.battery_start_percent - depleted_percent, 0.0, 100.0))
 
     def _start_battery_if_trigger_locked(self, index: int) -> bool:
         if self.battery_started_at is not None or index < 0 or index >= len(self.route):
@@ -461,7 +462,7 @@ class DemoState:
         if self.route[index].label.strip().casefold() != BATTERY_START_LABEL.casefold():
             return False
         self.battery_started_at = time.time()
-        self.battery_percent = 100.0
+        self.battery_percent = self.battery_start_percent
         return True
 
     def check_battery_depleted(self) -> bool:
@@ -3078,7 +3079,7 @@ async def run_demo(args):
                 len(route),
             )
 
-        state = DemoState(route)
+        state = DemoState(route, battery_start_percent=args.battery_start_percent)
         if args.wind:
             state.set_wind_enabled(True, "initializing")
             wind_field = create_wrf_wind_field(world, args)
@@ -3436,6 +3437,12 @@ def build_parser():
         type=float,
         default=35.0,
         help="Abort auto-flight if the drone passes this far beyond the active target. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--battery-start-percent",
+        type=float,
+        default=100.0,
+        help="Battery percentage shown when the mission battery timer starts.",
     )
     parser.add_argument(
         "--route-stuck-timeout-sec",
