@@ -115,6 +115,16 @@ OFFSHORE_ROUTE = [
     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
 ]
+# OFFSHORE_ROUTE = [
+#     ("Origin", [0.0, 148.0, -2.0], 270.0),
+#     ("Mission Start", [0.0, 130.0, -2.0], 270.0),
+#     ("Around waypoint 1", [12.85,-11.4,-115], 127.6),
+#     ("Waypoint 1", [1.28, -14.66, -115.16], 127.6),
+#     ("Around waypoint 2", [881.6,17,-113], 324.3),
+#     ("Waypoint 2", [893.69, 7.89, -112.77], 324.3)
+# ]
+
+
 
 TELEPORT_WARN_ERROR_M = 5.0
 FPV_MAX_CAMERA_OFFSET_M = 8.0
@@ -585,6 +595,8 @@ class OffshorePreview:
         record_video: bool = False,
         video_dir: Optional[Path] = None,
         video_fps: float = 0.0,
+        coordinate_diagnostics: bool = False,
+        front_camera_stabilized: bool = False,
     ):
         self.state = state
         self.window_name = window_name
@@ -592,6 +604,8 @@ class OffshorePreview:
         self.height = height
         self.pip_scale = max(0.1, min(0.5, pip_scale))
         self.max_fps = max(1.0, max_fps)
+        self.coordinate_diagnostics = bool(coordinate_diagnostics)
+        self.front_camera_stabilized = bool(front_camera_stabilized)
         self.record_video = bool(record_video)
         self.video_dir = Path(video_dir) if video_dir is not None else VIDEO_DIR
         self.video_fps = self.max_fps if video_fps <= 0.0 else max(1.0, video_fps)
@@ -796,7 +810,8 @@ class OffshorePreview:
                         frame = self.make_waiting_frame(cv2)
                         self.draw_route_overlay(cv2, frame)
                         self.draw_status(cv2, frame)
-                        self.draw_diagnostics(cv2, frame)
+                        if self.coordinate_diagnostics:
+                            self.draw_diagnostics(cv2, frame)
                         self.draw_battery(cv2, frame)
                         self.draw_coverage_unfeasible(cv2, frame)
                         if not created:
@@ -823,7 +838,8 @@ class OffshorePreview:
 
                 self.draw_route_overlay(cv2, frame)
                 self.draw_status(cv2, frame)
-                self.draw_diagnostics(cv2, frame)
+                if self.coordinate_diagnostics:
+                    self.draw_diagnostics(cv2, frame)
                 self.draw_battery(cv2, frame)
                 self.draw_coverage_unfeasible(cv2, frame)
 
@@ -881,14 +897,18 @@ class OffshorePreview:
             return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
         return frame
 
-    def draw_chase_pip(self, cv2, frame, chase):
+    def chase_pip_rect(self, frame) -> Tuple[int, int, int, int]:
         height, width = frame.shape[:2]
         pip_w = int(width * self.pip_scale)
         pip_h = int(pip_w * 9 / 16)
         pip_h = min(pip_h, int(height * 0.35))
-        pip = cv2.resize(chase, (pip_w, pip_h))
         x0 = width - pip_w - 16
         y0 = 16
+        return x0, y0, pip_w, pip_h
+
+    def draw_chase_pip(self, cv2, frame, chase):
+        x0, y0, pip_w, pip_h = self.chase_pip_rect(frame)
+        pip = cv2.resize(chase, (pip_w, pip_h))
         frame[y0 : y0 + pip_h, x0 : x0 + pip_w] = pip
         cv2.rectangle(frame, (x0, y0), (x0 + pip_w, y0 + pip_h), (255, 255, 255), 2)
         self.draw_text(cv2, frame, "Chase", (x0 + 8, y0 + 22), scale=0.55)
@@ -959,11 +979,16 @@ class OffshorePreview:
         target = self.state.route[snapshot["target_index"]]
         position = snapshot["position"]
         distance = distance_between(position, target.position)
+        camera_status = (
+            "Front Camera Stabilized"
+            if self.front_camera_stabilized
+            else "Front Camera not stabilized"
+        )
         lines = [
             f"Target: {target.label}  {distance:.1f} m",
             f"NED: x={position[0]:.1f} y={position[1]:.1f} z={position[2]:.1f}",
             f"Heading: {snapshot['heading_deg']:.1f} deg  Mode: {snapshot['mode']}",
-            f"{snapshot['mode_detail']} | e/r teleport | t custom | q/esc quit",
+            camera_status,
         ]
         if snapshot["wind_enabled"]:
             wind_sample = snapshot["wind_sample"]
@@ -977,8 +1002,14 @@ class OffshorePreview:
                     f"{wind_sample.direction_to_deg:.0f} deg  "
                     f"VERT {wind_sample.w_up_mps:+.2f} m/s"
                 )
-        line_spacing = 18
-        y = frame.shape[0] - (line_spacing * len(lines) + 4)
+        lines.extend(
+            [
+                snapshot["mode_detail"],
+                "e/r teleport | t custom | q/esc quit",
+            ]
+        )
+        line_spacing = 22
+        y = frame.shape[0] - (line_spacing * len(lines) + 8)
         for line in lines:
             is_wind_line = line.startswith("WIND ")
             if is_wind_line and snapshot.get("wind_sample") is not None:
@@ -1016,12 +1047,15 @@ class OffshorePreview:
         percent = clamp(float(snapshot["battery_percent"]), 0.0, 100.0)
         red = (0, 0, 255)
         height, width = frame.shape[:2]
-        body_w = 126
-        body_h = 30
-        tip_w = 8
-        percent_w = 62
-        x = max(18, width - body_w - tip_w - percent_w - 28)
-        y = max(18, height - body_h - 20)
+        body_w = 63
+        body_h = 15
+        tip_w = 4
+        percent_w = 15
+        pip_x, pip_y, pip_w, pip_h = self.chase_pip_rect(frame)
+        x = max(18, pip_x)
+        y = max(18, min(height - body_h - 18, pip_y + pip_h + 12))
+        if x + body_w + tip_w + percent_w + 12 > width - 18:
+            x = max(18, width - body_w - tip_w - percent_w - 30)
 
         cv2.rectangle(frame, (x, y), (x + body_w, y + body_h), red, 2)
         cv2.rectangle(
@@ -3053,9 +3087,11 @@ async def run_demo(args):
             args.preview_height,
             args.pip_scale,
             args.preview_fps,
-            args.video,
-            Path(args.video_dir),
-            args.video_fps,
+            record_video=args.video,
+            video_dir=Path(args.video_dir),
+            video_fps=args.video_fps,
+            coordinate_diagnostics=args.coordinate_diagnostics,
+            front_camera_stabilized=args.gimbal,
         )
         preview.start()
         client.subscribe(fpv_topic, preview.receive_fpv)
@@ -3498,6 +3534,11 @@ def build_parser():
     parser.add_argument("--preview-height", type=int, default=720)
     parser.add_argument("--preview-fps", type=float, default=30.0)
     parser.add_argument("--pip-scale", type=float, default=0.30)
+    parser.add_argument(
+        "--coordinate-diagnostics",
+        action="store_true",
+        help="Draw the coordinate diagnostics table in the FPV preview.",
+    )
     parser.add_argument(
         "--wind",
         action="store_true",
