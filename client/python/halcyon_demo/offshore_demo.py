@@ -911,13 +911,15 @@ class OffshorePreview:
         pip = cv2.resize(chase, (pip_w, pip_h))
         frame[y0 : y0 + pip_h, x0 : x0 + pip_w] = pip
         cv2.rectangle(frame, (x0, y0), (x0 + pip_w, y0 + pip_h), (255, 255, 255), 2)
-        self.draw_text(cv2, frame, "Chase", (x0 + 8, y0 + 22), scale=0.55)
+        self.draw_text(cv2, frame, "TPV", (x0 + 8, y0 + 22), scale=0.55)
 
     def draw_route_overlay(self, cv2, frame):
+        height, width = frame.shape[:2]
         origin_x = 18
-        origin_y = 56
-        map_w = 300
-        map_h = 300
+        origin_y = 46
+        map_size = int(clamp(min(width * 0.26, height * 0.32), 165.0, 250.0))
+        map_w = map_size
+        map_h = map_size
         pad_m = 80.0
         span_x = max(1.0, self.map_max_x - self.map_min_x + pad_m * 2)
         span_y = max(1.0, self.map_max_y - self.map_min_y + pad_m * 2)
@@ -945,7 +947,7 @@ class OffshorePreview:
             (235, 235, 235),
             1,
         )
-        self.draw_text(cv2, frame, "Route", (origin_x, origin_y - 8), scale=0.55)
+        self.draw_text(cv2, frame, "Route", (origin_x, origin_y - 8), scale=0.43)
 
         route_pixels = [to_px(point.position) for point in self.state.route]
         for start, end in zip(route_pixels, route_pixels[1:]):
@@ -954,13 +956,13 @@ class OffshorePreview:
         snapshot = self.state.snapshot()
         for index, point in enumerate(self.state.route):
             color = (0, 0, 255)
-            radius = 6
+            radius = max(3, int(map_size * 0.018))
             if index == snapshot["current_index"]:
                 color = (0, 210, 255)
-                radius = 8
+                radius = max(4, int(map_size * 0.024))
             elif index == snapshot["target_index"]:
                 color = (0, 255, 255)
-                radius = 8
+                radius = max(4, int(map_size * 0.024))
             cv2.circle(frame, to_px(point.position), radius, color, -1, cv2.LINE_AA)
 
         pos_px = to_px(snapshot["position"])
@@ -969,7 +971,7 @@ class OffshorePreview:
             pos_px,
             (80, 255, 80),
             markerType=cv2.MARKER_TRIANGLE_UP,
-            markerSize=18,
+            markerSize=max(10, int(map_size * 0.055)),
             thickness=2,
             line_type=cv2.LINE_AA,
         )
@@ -1008,16 +1010,19 @@ class OffshorePreview:
                 "e/r teleport | t custom | q/esc quit",
             ]
         )
-        line_spacing = 22
-        y = frame.shape[0] - (line_spacing * len(lines) + 8)
+        height, width = frame.shape[:2]
+        text_scale = 0.38 if width <= 800 or height <= 650 else 0.44
+        line_spacing = 17 if text_scale <= 0.38 else 20
+        y = height - (line_spacing * len(lines) + 8)
         for line in lines:
             is_wind_line = line.startswith("WIND ")
             if is_wind_line and snapshot.get("wind_sample") is not None:
-                self.draw_wind_arrow(cv2, frame, snapshot, (42, y - 7), 15)
-                text_x = 68
+                arrow_radius = 12 if text_scale <= 0.38 else 14
+                self.draw_wind_arrow(cv2, frame, snapshot, (36, y - 6), arrow_radius)
+                text_x = 56 if text_scale <= 0.38 else 64
             else:
                 text_x = 18
-            self.draw_text(cv2, frame, line, (text_x, y), scale=0.50)
+            self.draw_text(cv2, frame, line, (text_x, y), scale=text_scale)
             y += line_spacing
 
     def draw_wind_arrow(self, cv2, frame, snapshot: Dict, center: Tuple[int, int], radius: int):
@@ -1080,8 +1085,8 @@ class OffshorePreview:
             cv2,
             frame,
             f"{percent:3.0f}%",
-            (x + body_w + tip_w + 12, y + 22),
-            scale=0.66,
+            (x + body_w + tip_w + 8, y + 13),
+            scale=0.38,
             color=red,
         )
 
