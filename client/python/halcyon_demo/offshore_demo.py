@@ -1278,8 +1278,9 @@ def default_front_camera_sensor(
     height: int,
     fov_degrees: float,
     capture_interval_sec: float,
+    enable_gimbal: bool = False,
 ):
-    return {
+    sensor = {
         "id": "FrontCamera",
         "type": "camera",
         "enabled": True,
@@ -1303,6 +1304,13 @@ def default_front_camera_sensor(
             "rpy-deg": "0 0 0",
         },
     }
+    if enable_gimbal:
+        sensor["gimbal"] = {
+            "lock-roll": True,
+            "lock-pitch": True,
+            "lock-yaw": False,
+        }
+    return sensor
 
 
 def ensure_camera(
@@ -1312,6 +1320,7 @@ def ensure_camera(
     height: int,
     fov_degrees: float,
     capture_interval_sec: float,
+    enable_gimbal: bool = False,
 ):
     sensors = robot_config.setdefault("sensors", [])
     sensor = next((candidate for candidate in sensors if candidate.get("id") == camera_id), None)
@@ -1319,13 +1328,25 @@ def ensure_camera(
         if camera_id != "FrontCamera":
             raise RuntimeError(f"Camera '{camera_id}' is not present in the robot config")
         sensors.append(
-            default_front_camera_sensor(width, height, fov_degrees, capture_interval_sec)
+            default_front_camera_sensor(
+                width,
+                height,
+                fov_degrees,
+                capture_interval_sec,
+                enable_gimbal=enable_gimbal,
+            )
         )
         projectairsim_log().info("Runtime config added FrontCamera for FPV")
         return
     if sensor.get("type") != "camera":
         raise RuntimeError(f"Sensor '{camera_id}' exists but is not a camera")
     ensure_scene_camera_capture(sensor, width, height, fov_degrees, capture_interval_sec)
+    if camera_id == "FrontCamera" and enable_gimbal:
+        sensor["gimbal"] = {
+            "lock-roll": True,
+            "lock-pitch": True,
+            "lock-yaw": False,
+        }
 
 
 def ensure_px4_route_speed_params(robot_config: Dict, args):
@@ -1402,6 +1423,7 @@ def make_runtime_scene_config(args, route: Sequence[RoutePoint]):
                     args.camera_height,
                     args.camera_fov_degrees,
                     args.camera_capture_interval_sec,
+                    enable_gimbal=args.gimbal,
                 )
                 ensure_camera(
                     robot_config,
@@ -3466,6 +3488,11 @@ def build_parser():
     parser.add_argument("--camera-height", type=int, default=720)
     parser.add_argument("--camera-fov-degrees", type=float, default=90.0)
     parser.add_argument("--camera-capture-interval-sec", type=float, default=0.03)
+    parser.add_argument(
+        "--gimbal",
+        action="store_true",
+        help="Enable built-in roll/pitch stabilization for the runtime FrontCamera.",
+    )
     parser.add_argument("--window-name", default="Offshore PX4 Demo")
     parser.add_argument("--preview-width", type=int, default=1280)
     parser.add_argument("--preview-height", type=int, default=720)
