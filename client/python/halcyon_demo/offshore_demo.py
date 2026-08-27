@@ -98,7 +98,7 @@ from wrf_wind import WRFWindField, WRFWindSample  # noqa: E402
 #     ("Around waypoint 6", [-890, -11, -12.82], 111.0),
 #     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
 #     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
-OFFSHORE_ROUTE = [
+FULL_OFFSHORE_ROUTE = [
     ("Origin", [0.0, 148.0, -2.0], 270.0),
     ("Mission Start", [0.0, 130.0, -2.0], 270.0),
     ("Around waypoint 1", [12.85,-11.4,-115], 127.6),
@@ -115,14 +115,15 @@ OFFSHORE_ROUTE = [
     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
 ]
-# OFFSHORE_ROUTE = [
-#     ("Origin", [0.0, 148.0, -2.0], 270.0),
-#     ("Mission Start", [0.0, 130.0, -2.0], 270.0),
-#     ("Around waypoint 1", [12.85,-11.4,-115], 127.6),
-#     ("Waypoint 1", [1.28, -14.66, -115.16], 127.6),
-#     ("Around waypoint 2", [881.6,17,-113], 324.3),
-#     ("Waypoint 2", [893.69, 7.89, -112.77], 324.3)
-# ]
+OFFSHORE_ROUTE = [
+    ("Origin", [-30.7, -905.2, -50.4], 178.4),
+    ("Mission Start", [-40.7, -909.2, -112.4], 178.4),
+    ("Around waypoint 5", [-880, -895, -16], 180.0),
+    ("Waypoint 5", [-892, -902, -12.0], 164),
+    ("Around waypoint 6", [-890, -11, -12.82], 111.0),
+    ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
+    ("Return Origin", [0.0, 148.0, -2.0], 90.0),
+]
 
 
 
