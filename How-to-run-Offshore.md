@@ -34,3 +34,8 @@ Keyboard controls:
 - T: Teleport
     - After pressing it, type coordinates in the format "x,y,z" and press enter to teleport to that location
 - Q: quit
+
+
+### How to run autoflight?
+`python offshore_demo.py --mode-flight auto-flight --route-speed-mps 4 --slowdown-distance-m 15 --video`
+use `--wind` to simulate real wind from WRF data.

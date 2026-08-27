@@ -6,6 +6,7 @@ PX4 scene, spawns Drone1 at OFFSHORE_ROUTE[0], and shows FPV with a
 chase-camera picture-in-picture. E/R teleport between the route points. Use
 --mode-flight auto-flight to teleport to Origin and fly OFFSHORE_ROUTE exactly
 as listed. Add --video to record the preview window to client/python/halcyon_demo/video.
+Add --wind to apply spatially varying WRF wind and show it in the FPV telemetry.
 
 Controls in the OpenCV preview:
   e  teleport to next route point
@@ -38,7 +39,9 @@ from projectairsim.utils import projectairsim_log, unpack_image
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent.parent
 VIDEO_DIR = SCRIPT_DIR / "video"
+DEFAULT_WRF_FILE = REPO_ROOT / "wind_data" / "file.nc"
 EXAMPLE_SCRIPTS_DIR = SCRIPT_DIR.parent / "example_user_scripts"
 if str(EXAMPLE_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(EXAMPLE_SCRIPTS_DIR))
@@ -65,6 +68,8 @@ from route_replan_static import (  # noqa: E402
     find_static_route_obstacle,
     is_route_corridor_clear,
 )
+
+from wrf_wind import WRFWindField, WRFWindSample  # noqa: E402
 
 
 # Old route 
@@ -399,6 +404,9 @@ class DemoState:
         self.battery_percent = 100.0
         self.coverage_unfeasible = False
         self.coverage_unfeasible_logged = False
+        self.wind_enabled = False
+        self.wind_sample = None
+        self.wind_status = ""
         self.teleport_requests = queue.SimpleQueue()
         self.manual_teleport_requests = queue.SimpleQueue()
         self.stop_requested = False
@@ -423,6 +431,9 @@ class DemoState:
                 "battery_active": self.battery_started_at is not None,
                 "battery_percent": self.battery_percent,
                 "coverage_unfeasible": self.coverage_unfeasible,
+                "wind_enabled": self.wind_enabled,
+                "wind_sample": self.wind_sample,
+                "wind_status": self.wind_status,
                 "stop_requested": self.stop_requested,
             }
 
@@ -511,6 +522,19 @@ class DemoState:
     def set_auto_flight_running(self, running: bool):
         with self.lock:
             self.auto_flight_running = bool(running)
+
+    def set_wind_enabled(self, enabled: bool, status: str = ""):
+        with self.lock:
+            self.wind_enabled = bool(enabled)
+            self.wind_status = status
+            if not enabled:
+                self.wind_sample = None
+
+    def update_wind_sample(self, sample: WRFWindSample, status: str = ""):
+        with self.lock:
+            self.wind_enabled = True
+            self.wind_sample = sample
+            self.wind_status = status
 
     def update_image_diagnostic(self, name: str, image):
         position = image_pose_position(image)
@@ -941,10 +965,23 @@ class OffshorePreview:
             f"Heading: {snapshot['heading_deg']:.1f} deg  Mode: {snapshot['mode']}",
             f"{snapshot['mode_detail']} | e/r teleport | t custom | q/esc quit",
         ]
-        y = frame.shape[0] - 92
+        if snapshot["wind_enabled"]:
+            wind_sample = snapshot["wind_sample"]
+            if wind_sample is None:
+                status = snapshot["wind_status"] or "initializing"
+                lines.append(f"WIND {status}")
+            else:
+                # Direction TO: 0 deg = North, 90 deg = East, matching the AirSim N/E vector.
+                lines.append(
+                    f"WIND {wind_sample.horizontal_speed_mps:.1f} m/s @ "
+                    f"{wind_sample.direction_to_deg:.0f} deg  "
+                    f"VERT {wind_sample.w_up_mps:+.2f} m/s"
+                )
+        line_spacing = 18
+        y = frame.shape[0] - (line_spacing * len(lines) + 4)
         for line in lines:
-            self.draw_text(cv2, frame, line, (18, y), scale=0.55)
-            y += 22
+            self.draw_text(cv2, frame, line, (18, y), scale=0.50)
+            y += line_spacing
 
     def draw_battery(self, cv2, frame):
         snapshot = self.state.snapshot()
@@ -1983,6 +2020,134 @@ async def hold_then_request_stop(state: DemoState):
     state.request_stop()
 
 
+def resolve_wrf_path(args) -> Path:
+    requested = Path(args.wrf_file)
+    if not requested.is_absolute():
+        requested = REPO_ROOT / requested
+    if requested.exists():
+        return requested
+
+    if str(args.wrf_file) == str(DEFAULT_WRF_FILE):
+        nc_files = sorted((REPO_ROOT / "wind_data").glob("*.nc"))
+        if len(nc_files) == 1:
+            projectairsim_log().warning(
+                "Default WRF file %s was not found; using only available NetCDF file %s",
+                requested,
+                nc_files[0],
+            )
+            return nc_files[0]
+
+    raise FileNotFoundError(f"WRF file not found: {requested}")
+
+
+def resolve_wrf_origin(args) -> Tuple[Optional[float], Optional[float]]:
+    if args.wrf_origin_lat is not None or args.wrf_origin_lon is not None:
+        if args.wrf_origin_lat is None or args.wrf_origin_lon is None:
+            raise ValueError("--wrf-origin-lat and --wrf-origin-lon must be provided together")
+        return float(args.wrf_origin_lat), float(args.wrf_origin_lon)
+
+    return None, None
+
+
+def create_wrf_wind_field(_world: World, args) -> WRFWindField:
+    wrf_path = resolve_wrf_path(args)
+    origin_lat, origin_lon = resolve_wrf_origin(args)
+    try:
+        field = WRFWindField(
+            wrf_path,
+            origin_lat,
+            origin_lon,
+            time_index=args.wrf_time_index,
+            region_half_size_m=args.wrf_region_half_size_m,
+            altitude_min_agl_m=args.wrf_altitude_min_agl_m,
+            altitude_max_agl_m=args.wrf_altitude_max_agl_m,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{exc}. The Unreal scene is synthetic and not georeferenced; use "
+            "--wrf-origin-lat and --wrf-origin-lon only to choose the WRF cell "
+            "mapped to simulation NED [0,0,0]."
+        ) from exc
+
+    for line in field.startup_summary_lines():
+        projectairsim_log().info(line)
+    if field.origin_hgt_m > 25.0:
+        projectairsim_log().warning(
+            "WRF origin HGT %.2f m is unexpectedly high for an offshore demo.",
+            field.origin_hgt_m,
+        )
+    if field.origin_landmask >= 0.5:
+        projectairsim_log().warning(
+            "WRF origin LANDMASK=%.0f indicates land, not water.",
+            field.origin_landmask,
+        )
+    return field
+
+
+def log_wrf_debug(sample: WRFWindSample):
+    projectairsim_log().info("WRF WIND")
+    projectairsim_log().info(
+        "Sim position NED:  N=%.1f E=%.1f D=%.1f",
+        sample.sim_north_m,
+        sample.sim_east_m,
+        sample.sim_down_m,
+    )
+    projectairsim_log().info("WRF location:      lat=%.7f lon=%.7f", sample.lat, sample.lon)
+    projectairsim_log().info("Altitude AGL:      %.1f m", sample.altitude_agl_m)
+    projectairsim_log().info("U East:            %.3f m/s", sample.u_east_mps)
+    projectairsim_log().info("V North:           %.3f m/s", sample.v_north_mps)
+    projectairsim_log().info("W Up:              %.3f m/s", sample.w_up_mps)
+    projectairsim_log().info("AirSim North:      %.3f m/s", sample.north_mps)
+    projectairsim_log().info("AirSim East:       %.3f m/s", sample.east_mps)
+    projectairsim_log().info("AirSim Down:       %.3f m/s", sample.down_mps)
+    projectairsim_log().info(
+        "Speed:             %.3f m/s direction TO %.1f deg",
+        sample.horizontal_speed_mps,
+        sample.direction_to_deg,
+    )
+    if sample.outside_region:
+        projectairsim_log().warning(
+            "WRF wind sample is outside configured wind-farm region; continuing interpolation."
+        )
+    if sample.outside_dataset:
+        projectairsim_log().warning(
+            "WRF wind sample is outside the WRF grid; using nearest grid edge."
+        )
+    if sample.w_vertical_note:
+        projectairsim_log().info("Vertical W note:   %s", sample.w_vertical_note)
+
+
+async def run_wrf_wind_updater(
+    drone: Drone,
+    world: World,
+    state: DemoState,
+    wrf_field: WRFWindField,
+    args,
+):
+    update_interval_sec = 1.0 / max(0.1, float(args.wind_update_hz))
+    last_debug_at = 0.0
+    try:
+        while not state.snapshot()["stop_requested"]:
+            position_ned = get_pose_position_ned(drone)
+            sample = wrf_field.sample_ned(position_ned)
+            world.set_wind_velocity(sample.north_mps, sample.east_mps, sample.down_mps)
+            state.update_wind_sample(sample)
+
+            now = time.time()
+            if args.wrf_debug and now - last_debug_at >= 1.0:
+                log_wrf_debug(sample)
+                last_debug_at = now
+
+            await asyncio.sleep(update_interval_sec)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        projectairsim_log().warning("WRF wind updater failed: %s", exc)
+        projectairsim_log().warning("WRF wind updater traceback:\n%s", traceback.format_exc())
+        state.set_wind_enabled(False, "failed")
+        state.request_stop()
+
+
 def drain_manual_teleport_request(state: DemoState) -> bool:
     requested = False
     while not state.manual_teleport_requests.empty():
@@ -2770,8 +2935,11 @@ async def run_demo(args):
     route = route_from_constants()
     state = None
     temp_config_dir = None
+    world = None
     drone = None
     preview = None
+    wind_field = None
+    wind_task = None
     client = ProjectAirSimClient(
         address=args.server_ip,
         port_topics=args.topics_port,
@@ -2822,6 +2990,12 @@ async def run_demo(args):
             )
 
         state = DemoState(route)
+        if args.wind:
+            state.set_wind_enabled(True, "initializing")
+            wind_field = create_wrf_wind_field(world, args)
+            wind_task = asyncio.create_task(
+                run_wrf_wind_updater(drone, world, state, wind_field, args)
+            )
         preview = OffshorePreview(
             state,
             args.window_name,
@@ -2869,6 +3043,17 @@ async def run_demo(args):
     finally:
         if state is not None:
             state.request_stop()
+        if wind_task is not None:
+            wind_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await wind_task
+        if args.wind and world is not None:
+            try:
+                world.set_wind_velocity(0.0, 0.0, 0.0)
+            except Exception:
+                pass
+        if wind_field is not None:
+            wind_field.close()
         if preview is not None:
             preview.stop()
         if preview is not None and preview.error is not None:
@@ -3258,6 +3443,69 @@ def build_parser():
     parser.add_argument("--preview-height", type=int, default=720)
     parser.add_argument("--preview-fps", type=float, default=30.0)
     parser.add_argument("--pip-scale", type=float, default=0.30)
+    parser.add_argument(
+        "--wind",
+        action="store_true",
+        help="Enable spatially varying WRF wind and show wind telemetry in the FPV overlay.",
+    )
+    parser.add_argument(
+        "--wrf-file",
+        default=str(DEFAULT_WRF_FILE),
+        help="WRF NetCDF file used by --wind.",
+    )
+    parser.add_argument(
+        "--wrf-origin-lat",
+        type=float,
+        default=None,
+        help=(
+            "WRF latitude mapped to simulation NED [0,0,0]. "
+            "Defaults to an auto-selected offshore LANDMASK=0 WRF cell."
+        ),
+    )
+    parser.add_argument(
+        "--wrf-origin-lon",
+        type=float,
+        default=None,
+        help=(
+            "WRF longitude mapped to simulation NED [0,0,0]. "
+            "Defaults to an auto-selected offshore LANDMASK=0 WRF cell."
+        ),
+    )
+    parser.add_argument(
+        "--wrf-time-index",
+        type=int,
+        default=0,
+        help="Time index to read from the WRF file.",
+    )
+    parser.add_argument(
+        "--wind-update-hz",
+        type=float,
+        default=5.0,
+        help="How often to sample WRF wind and update Project AirSim wind.",
+    )
+    parser.add_argument(
+        "--wrf-region-half-size-m",
+        type=float,
+        default=1000.0,
+        help="Half-size of the intended local wind-farm region around NED origin.",
+    )
+    parser.add_argument(
+        "--wrf-altitude-min-agl-m",
+        type=float,
+        default=0.0,
+        help="Lower AGL bound for startup/debug wind-region reporting.",
+    )
+    parser.add_argument(
+        "--wrf-altitude-max-agl-m",
+        type=float,
+        default=100.0,
+        help="Upper AGL bound for startup/debug wind-region reporting.",
+    )
+    parser.add_argument(
+        "--wrf-debug",
+        action="store_true",
+        help="Print detailed WRF wind samples about once per second.",
+    )
     parser.add_argument(
         "--video",
         action="store_true",
