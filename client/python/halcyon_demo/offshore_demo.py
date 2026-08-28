@@ -8,7 +8,11 @@ chase-camera picture-in-picture. E/R teleport between the route points. Use
 as listed. Add --video to record the preview window to client/python/halcyon_demo/video.
 Add --wind to apply spatially varying WRF wind and show it in the FPV telemetry.
 
-Controls in the OpenCV preview:
+Controls:
+  w/s/a/d  manual forward/back/left/right in manual-direct or manual-px4
+  up/down  manual altitude up/down in manual-direct or manual-px4
+  left/right  manual yaw left/right in manual-direct or manual-px4
+  k/l  increase/decrease manual speed
   e  teleport to next route point
   r  teleport to previous route point
   t  enter custom teleport as x,y,z,angle
@@ -57,6 +61,8 @@ from px4_astar_autopilot import (  # noqa: E402
     get_pose_yaw_ned,
     heading_deg_360,
     limit_vector_delta,
+    load_keyboard_module,
+    move_scalar_toward,
     request_px4_control,
     sparsify_path,
     wait_for_px4_ready,
@@ -1114,12 +1120,10 @@ class OffshorePreview:
                     f"{wind_sample.direction_to_deg:.0f} deg  "
                     f"VERT {wind_sample.w_up_mps:+.2f} m/s"
                 )
-        lines.extend(
-            [
-                snapshot["mode_detail"],
-                "e/r teleport | t custom | q/esc quit",
-            ]
-        )
+        control_hint = "e/r teleport | t custom | q/esc quit"
+        if str(snapshot["mode"]).startswith("manual "):
+            control_hint = "WASD/arrows fly | K/L speed | e/r/t teleport | q/esc quit"
+        lines.extend([snapshot["mode_detail"], control_hint])
         height, width = frame.shape[:2]
         text_scale = 0.38 if width <= 800 or height <= 650 else 0.44
         line_spacing = 17 if text_scale <= 0.38 else 20
@@ -1637,16 +1641,29 @@ def ensure_px4_route_speed_params(robot_config: Dict, args):
     px4_settings = controller.setdefault("px4-settings", {})
     parameters = px4_settings.setdefault("parameters", {})
     xy_speed_mps = max(0.1, float(args.route_speed_mps))
+    manual_px4_mode = args.mode_flight in {"manual-px4", "px4"}
+    if manual_px4_mode:
+        xy_speed_mps = max(
+            xy_speed_mps,
+            float(args.manual_px4_param_speed_limit_mps),
+            manual_initial_speed_mps(args),
+        )
     configured_vertical_speed_mps = float(args.route_vertical_speed_mps)
     vertical_speed_mps = max(
         0.1,
         configured_vertical_speed_mps if configured_vertical_speed_mps > 0.0 else xy_speed_mps,
     )
+    if manual_px4_mode:
+        vertical_speed_mps = max(
+            vertical_speed_mps,
+            float(args.manual_px4_param_vertical_speed_limit_mps),
+        )
     parameters.update(
         {
             "MPC_VEL_MANUAL": xy_speed_mps,
             "MPC_XY_CRUISE": xy_speed_mps,
             "MPC_XY_VEL_MAX": xy_speed_mps,
+            "MPC_Z_VEL_MAX_UP": vertical_speed_mps,
             "MPC_Z_VEL_MAX_DN": vertical_speed_mps,
         }
     )
@@ -3246,12 +3263,317 @@ async def run_auto_diagnostic_mission(
         state.request_stop()
 
 
+def manual_initial_speed_mps(args) -> float:
+    configured = args.manual_speed_mps
+    if configured is None:
+        configured = args.route_speed_mps
+    return max(float(args.manual_min_speed_mps), float(configured))
+
+
+def print_manual_controls(
+    mode_label: str,
+    current_speed_mps: float,
+    speed_step_mps: float,
+):
+    print(f"\n--- {mode_label} ---")
+    print("W/S: forward/backward")
+    print("A/D: left/right")
+    print("Up/Down Arrows: up/down altitude")
+    print("Left/Right Arrows: yaw left/right")
+    print("K/L: increase/decrease speed")
+    print("E/R/T: route/custom teleport in the preview window")
+    print("Q/Esc: exit")
+    print(f"Speed: {current_speed_mps:.1f} m/s")
+    print(f"Speed step: {speed_step_mps:.1f} m/s")
+    print("Speed cap: unbounded")
+    print("----------------------------")
+
+
+async def run_manual_direct_flight(
+    drone: Drone,
+    state: DemoState,
+    args,
+    world: Optional[World] = None,
+):
+    keyboard_module = load_keyboard_module()
+    current_speed_mps = manual_initial_speed_mps(args)
+    speed_step_mps = max(0.1, float(args.manual_speed_step_mps))
+    min_speed_mps = max(0.0, float(args.manual_min_speed_mps))
+    yaw_rate_dps = max(0.0, float(args.manual_yaw_rate_dps))
+    speed_adjust_debounce_sec = 0.25
+    last_speed_adjust_at = 0.0
+    last_report_at = 0.0
+    last_tick_at = time.time()
+
+    state.set_mode("manual direct", f"speed {current_speed_mps:.1f} m/s")
+    print_manual_controls("Manual Direct Flight", current_speed_mps, speed_step_mps)
+    projectairsim_log().info(
+        "Manual direct flight active: WASD/arrows fly, K/L speed, q/esc quit"
+    )
+
+    while not state.snapshot()["stop_requested"]:
+        now = time.time()
+        dt = min(max(now - last_tick_at, 0.0), 0.1)
+        last_tick_at = now
+
+        if state.check_battery_depleted() or state.snapshot()["coverage_unfeasible"]:
+            log_coverage_unfeasible_if_needed(state)
+            await hold_then_request_stop(state)
+            break
+
+        if keyboard_module.is_pressed("q") or keyboard_module.is_pressed("esc"):
+            projectairsim_log().info("Manual direct flight requested exit")
+            state.request_stop()
+            break
+
+        if keyboard_module.is_pressed("k") and (
+            now - last_speed_adjust_at >= speed_adjust_debounce_sec
+        ):
+            current_speed_mps += speed_step_mps
+            state.set_mode("manual direct", f"speed {current_speed_mps:.1f} m/s")
+            projectairsim_log().info("Manual speed: %.1f m/s", current_speed_mps)
+            last_speed_adjust_at = now
+        elif keyboard_module.is_pressed("l") and (
+            now - last_speed_adjust_at >= speed_adjust_debounce_sec
+        ):
+            current_speed_mps = max(min_speed_mps, current_speed_mps - speed_step_mps)
+            state.set_mode("manual direct", f"speed {current_speed_mps:.1f} m/s")
+            projectairsim_log().info("Manual speed: %.1f m/s", current_speed_mps)
+            last_speed_adjust_at = now
+
+        current_ned = get_pose_position_ned(drone)
+        yaw_rad = get_pose_yaw_ned(drone)
+        target_yaw_rad = yaw_rad
+        if keyboard_module.is_pressed("left"):
+            target_yaw_rad -= math.radians(yaw_rate_dps) * dt
+        elif keyboard_module.is_pressed("right"):
+            target_yaw_rad += math.radians(yaw_rate_dps) * dt
+
+        body_velocity = [0.0, 0.0, 0.0]
+        if keyboard_module.is_pressed("w"):
+            body_velocity[0] = current_speed_mps
+        elif keyboard_module.is_pressed("s"):
+            body_velocity[0] = -current_speed_mps
+
+        if keyboard_module.is_pressed("a"):
+            body_velocity[1] = -current_speed_mps
+        elif keyboard_module.is_pressed("d"):
+            body_velocity[1] = current_speed_mps
+
+        if keyboard_module.is_pressed("up"):
+            body_velocity[2] = -current_speed_mps
+        elif keyboard_module.is_pressed("down"):
+            body_velocity[2] = current_speed_mps
+
+        world_velocity = [
+            body_velocity[0] * math.cos(target_yaw_rad)
+            - body_velocity[1] * math.sin(target_yaw_rad),
+            body_velocity[0] * math.sin(target_yaw_rad)
+            + body_velocity[1] * math.cos(target_yaw_rad),
+            body_velocity[2],
+        ]
+        moved = vector_length(world_velocity) > 1e-6
+        yaw_changed = abs(wrap_angle_rad(target_yaw_rad - yaw_rad)) > 1e-6
+        if moved or yaw_changed:
+            current_ned = [
+                current_ned[index] + world_velocity[index] * dt
+                for index in range(3)
+            ]
+            drone.set_pose(
+                make_pose_ned_yaw(current_ned, heading_deg_360(target_yaw_rad)),
+                reset_kinematics=True,
+            )
+
+        state.update_pose(ned_to_route(current_ned), heading_deg_360(target_yaw_rad))
+
+        if now - last_report_at >= args.pose_report_interval_sec:
+            projectairsim_log().info(
+                "Manual direct NED %s heading %.1f deg speed %.1f m/s command %.1f m/s",
+                format_vector3(current_ned),
+                heading_deg_360(target_yaw_rad),
+                current_speed_mps,
+                vector_length(world_velocity),
+            )
+            last_report_at = now
+
+        await asyncio.sleep(0.02)
+
+
+async def run_manual_px4_flight(
+    drone: Drone,
+    state: DemoState,
+    args,
+    world: Optional[World] = None,
+):
+    keyboard_module = load_keyboard_module()
+    current_speed_mps = manual_initial_speed_mps(args)
+    speed_step_mps = max(0.1, float(args.manual_speed_step_mps))
+    min_speed_mps = max(0.0, float(args.manual_min_speed_mps))
+    command_duration_sec = max(0.05, float(args.manual_command_duration_sec))
+    max_velocity_delta = (
+        max(0.0, float(args.manual_acceleration_limit_mps2)) * command_duration_sec
+    )
+    max_yaw_delta = (
+        max(0.0, float(args.manual_yaw_acceleration_dps2)) * command_duration_sec
+    )
+    yaw_rate_dps = max(0.0, float(args.manual_yaw_rate_dps))
+    speed_adjust_debounce_sec = 0.25
+    last_speed_adjust_at = 0.0
+    last_report_at = 0.0
+    last_camera_epoch = state.snapshot()["camera_epoch"]
+    commanded_velocity = [0.0, 0.0, 0.0]
+    commanded_yaw_rate_dps = 0.0
+    api_control_enabled = False
+
+    state.set_mode("manual px4", "arming PX4")
+    print_manual_controls("Manual PX4 Flight", current_speed_mps, speed_step_mps)
+    try:
+        if not drone.enable_api_control():
+            raise RuntimeError("Project AirSim rejected EnableApiControl for manual PX4 flight")
+        api_control_enabled = True
+        await arm_with_retry(drone, args.arm_timeout_sec)
+
+        if args.manual_px4_takeoff:
+            projectairsim_log().info("Manual PX4 takeoff requested")
+            takeoff_task = await drone.takeoff_async(timeout_sec=args.takeoff_timeout_sec)
+            await await_drone_task(
+                drone,
+                takeoff_task,
+                "Manual PX4 takeoff",
+                args.takeoff_timeout_sec + 5.0,
+                args.pose_report_interval_sec,
+            )
+
+        await request_px4_control(drone)
+        await asyncio.sleep(max(0.0, args.request_control_settle_sec))
+        state.set_mode("manual px4", f"speed {current_speed_mps:.1f} m/s")
+        projectairsim_log().info(
+            "Manual PX4 flight active: WASD/arrows fly, K/L speed, q/esc quit"
+        )
+
+        while not state.snapshot()["stop_requested"]:
+            now = time.time()
+            snapshot = state.snapshot()
+            if snapshot["camera_epoch"] != last_camera_epoch:
+                commanded_velocity = [0.0, 0.0, 0.0]
+                commanded_yaw_rate_dps = 0.0
+                last_camera_epoch = snapshot["camera_epoch"]
+
+            if state.check_battery_depleted() or state.snapshot()["coverage_unfeasible"]:
+                log_coverage_unfeasible_if_needed(state)
+                await hold_then_request_stop(state)
+                break
+
+            if keyboard_module.is_pressed("q") or keyboard_module.is_pressed("esc"):
+                projectairsim_log().info("Manual PX4 flight requested exit")
+                state.request_stop()
+                break
+
+            if keyboard_module.is_pressed("k") and (
+                now - last_speed_adjust_at >= speed_adjust_debounce_sec
+            ):
+                current_speed_mps += speed_step_mps
+                state.set_mode("manual px4", f"speed {current_speed_mps:.1f} m/s")
+                projectairsim_log().info("Manual speed: %.1f m/s", current_speed_mps)
+                last_speed_adjust_at = now
+            elif keyboard_module.is_pressed("l") and (
+                now - last_speed_adjust_at >= speed_adjust_debounce_sec
+            ):
+                current_speed_mps = max(min_speed_mps, current_speed_mps - speed_step_mps)
+                state.set_mode("manual px4", f"speed {current_speed_mps:.1f} m/s")
+                projectairsim_log().info("Manual speed: %.1f m/s", current_speed_mps)
+                last_speed_adjust_at = now
+
+            target_velocity = [0.0, 0.0, 0.0]
+            target_yaw_rate_dps = 0.0
+            if keyboard_module.is_pressed("w"):
+                target_velocity[0] = current_speed_mps
+            elif keyboard_module.is_pressed("s"):
+                target_velocity[0] = -current_speed_mps
+
+            if keyboard_module.is_pressed("a"):
+                target_velocity[1] = -current_speed_mps
+            elif keyboard_module.is_pressed("d"):
+                target_velocity[1] = current_speed_mps
+
+            if keyboard_module.is_pressed("up"):
+                target_velocity[2] = -current_speed_mps
+            elif keyboard_module.is_pressed("down"):
+                target_velocity[2] = current_speed_mps
+
+            if keyboard_module.is_pressed("left"):
+                target_yaw_rate_dps = -yaw_rate_dps
+            elif keyboard_module.is_pressed("right"):
+                target_yaw_rate_dps = yaw_rate_dps
+
+            commanded_velocity = limit_vector_delta(
+                commanded_velocity,
+                target_velocity,
+                max_velocity_delta,
+            )
+            commanded_yaw_rate_dps = move_scalar_toward(
+                commanded_yaw_rate_dps,
+                target_yaw_rate_dps,
+                max_yaw_delta,
+            )
+
+            should_send = (
+                vector_length(commanded_velocity) > 0.05
+                or vector_length(target_velocity) > 0.0
+                or abs(commanded_yaw_rate_dps) > 0.1
+                or abs(target_yaw_rate_dps) > 0.0
+            )
+            if should_send:
+                await drone.move_by_velocity_body_frame_async(
+                    commanded_velocity[0],
+                    commanded_velocity[1],
+                    commanded_velocity[2],
+                    command_duration_sec,
+                    yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
+                    yaw_is_rate=True,
+                    yaw=math.radians(commanded_yaw_rate_dps),
+                )
+
+            if now - last_report_at >= args.pose_report_interval_sec:
+                current_ned = get_pose_position_ned(drone)
+                actual_velocity = get_ground_truth_velocity_ned(drone)
+                state.update_pose(
+                    ned_to_route(current_ned),
+                    heading_deg_360(get_pose_yaw_ned(drone)),
+                )
+                projectairsim_log().info(
+                    "Manual PX4 NED %s heading %.1f deg speed %.1f m/s commanded %.1f actual %.1f m/s",
+                    format_vector3(current_ned),
+                    heading_deg_360(get_pose_yaw_ned(drone)),
+                    current_speed_mps,
+                    vector_length(commanded_velocity),
+                    vector_length(actual_velocity),
+                )
+                last_report_at = now
+
+            await asyncio.sleep(0.02)
+    finally:
+        cancel_last_task_safely(drone)
+        if api_control_enabled:
+            with suppress(Exception):
+                await brake_to_stop_by_velocity(
+                    drone,
+                    commanded_velocity,
+                    command_duration_sec,
+                    max_velocity_delta,
+                )
+            if not args.manual_keep_armed:
+                safe_call("Manual PX4 disarm", drone.disarm)
+                safe_call("Manual PX4 disable API control", drone.disable_api_control)
+
+
 async def run_teleport_viewer(
     drone: Drone,
     state: DemoState,
     args,
     world: Optional[World] = None,
     start_auto_flight: bool = False,
+    manual_flight_mode: Optional[str] = None,
 ):
     initial_ned = get_pose_position_ned(drone)
     initial_route = ned_to_route(initial_ned)
@@ -3268,6 +3590,15 @@ async def run_teleport_viewer(
         if start_auto_flight
         else None
     )
+    manual_flight_task = None
+    if manual_flight_mode == "direct":
+        manual_flight_task = asyncio.create_task(
+            run_manual_direct_flight(drone, state, args, world)
+        )
+    elif manual_flight_mode == "px4":
+        manual_flight_task = asyncio.create_task(
+            run_manual_px4_flight(drone, state, args, world)
+        )
 
     try:
         while not state.snapshot()["stop_requested"]:
@@ -3297,6 +3628,11 @@ async def run_teleport_viewer(
             if auto_flight_task is not None and auto_flight_task.done():
                 await auto_flight_task
                 auto_flight_task = None
+            if manual_flight_task is not None and manual_flight_task.done():
+                await manual_flight_task
+                manual_flight_task = None
+                if not state.snapshot()["stop_requested"]:
+                    state.request_stop()
 
             direction = drain_teleport_request(state)
             if direction is not None:
@@ -3341,6 +3677,11 @@ async def run_teleport_viewer(
             auto_flight_task.cancel()
             with suppress(asyncio.CancelledError):
                 await auto_flight_task
+        if manual_flight_task is not None and not manual_flight_task.done():
+            cancel_last_task_safely(drone)
+            manual_flight_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await manual_flight_task
 
 
 async def run_demo(args):
@@ -3360,6 +3701,10 @@ async def run_demo(args):
 
     try:
         mode_flight = "auto-diagnostic" if args.auto_diagnostic else args.mode_flight
+        mode_flight = {
+            "direct": "manual-direct",
+            "px4": "manual-px4",
+        }.get(mode_flight, mode_flight)
         temp_config_dir, scene_name, sim_config_path = make_runtime_scene_config(args, route)
 
         projectairsim_log().info("Connecting to Project AirSim")
@@ -3431,9 +3776,14 @@ async def run_demo(args):
             drone.robot_info["actual_pose"],
             lambda _, pose_msg: update_pose_topic_diagnostic(state, pose_msg),
         )
-        projectairsim_log().info("Preview opened. Press e/r/t for teleport controls, q/esc quits.")
+        projectairsim_log().info(
+            "Preview opened. Manual modes use WASD/arrows and K/L; e/r/t teleport; q/esc quits."
+        )
 
-        await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
+        if mode_flight == "manual-direct":
+            projectairsim_log().info("Manual direct mode: skipping PX4 readiness wait")
+        else:
+            await wait_for_px4_ready(drone, args.px4_ready_timeout_sec)
         initial_pose_ned = get_pose_position_ned(drone)
         initial_pose_route = ned_to_route(initial_pose_ned)
         state.update_pose(initial_pose_route, heading_deg_360(get_pose_yaw_ned(drone)))
@@ -3453,6 +3803,30 @@ async def run_demo(args):
                 args,
                 world,
                 start_auto_flight=True,
+            )
+        elif mode_flight == "manual-direct":
+            state.set_mode(
+                "manual direct",
+                f"speed {manual_initial_speed_mps(args):.1f} m/s",
+            )
+            await run_teleport_viewer(
+                drone,
+                state,
+                args,
+                world,
+                manual_flight_mode="direct",
+            )
+        elif mode_flight == "manual-px4":
+            state.set_mode(
+                "manual px4",
+                f"speed {manual_initial_speed_mps(args):.1f} m/s",
+            )
+            await run_teleport_viewer(
+                drone,
+                state,
+                args,
+                world,
+                manual_flight_mode="px4",
             )
         else:
             state.set_mode("teleport", "manual teleport mode")
@@ -3502,9 +3876,20 @@ def build_parser():
     parser.add_argument("--load-delay-sec", type=float, default=2.0)
     parser.add_argument(
         "--mode-flight",
-        choices=["teleport", "auto-flight", "auto-diagnostic"],
+        choices=[
+            "teleport",
+            "auto-flight",
+            "auto-diagnostic",
+            "manual-direct",
+            "manual-px4",
+            "direct",
+            "px4",
+        ],
         default="teleport",
-        help="Startup mode: manual teleport viewer, immediate PX4 route flight, or teleport diagnostics.",
+        help=(
+            "Startup mode: manual teleport viewer, immediate PX4 route flight, "
+            "teleport diagnostics, direct manual flight, or PX4 manual flight."
+        ),
     )
     parser.set_defaults(replan_on_object=False)
     parser.add_argument(
@@ -3668,6 +4053,70 @@ def build_parser():
         type=float,
         default=12.0,
         help="PX4 auto-flight speed.",
+    )
+    parser.add_argument(
+        "--manual-speed-mps",
+        type=float,
+        default=None,
+        help="Initial manual flight speed. Defaults to --route-speed-mps.",
+    )
+    parser.add_argument(
+        "--manual-speed-step-mps",
+        type=float,
+        default=5.0,
+        help="Manual speed increment/decrement for K/L.",
+    )
+    parser.add_argument(
+        "--manual-min-speed-mps",
+        type=float,
+        default=0.0,
+        help="Minimum manual speed after pressing L.",
+    )
+    parser.add_argument(
+        "--manual-yaw-rate-dps",
+        type=float,
+        default=60.0,
+        help="Manual yaw rate for left/right arrow keys.",
+    )
+    parser.add_argument(
+        "--manual-command-duration-sec",
+        type=float,
+        default=0.1,
+        help="Duration of each manual PX4 velocity command.",
+    )
+    parser.add_argument(
+        "--manual-acceleration-limit-mps2",
+        type=float,
+        default=20.0,
+        help="Manual PX4 velocity change rate. Higher values make K/L speed changes take effect faster.",
+    )
+    parser.add_argument(
+        "--manual-yaw-acceleration-dps2",
+        type=float,
+        default=180.0,
+        help="Manual PX4 yaw-rate change rate.",
+    )
+    parser.add_argument(
+        "--manual-px4-takeoff",
+        action="store_true",
+        help="Run a PX4 takeoff before manual PX4 control.",
+    )
+    parser.add_argument(
+        "--manual-keep-armed",
+        action="store_true",
+        help="Leave PX4 armed/API-control enabled after manual PX4 exits.",
+    )
+    parser.add_argument(
+        "--manual-px4-param-speed-limit-mps",
+        type=float,
+        default=250.0,
+        help="Runtime PX4 horizontal speed parameter used by manual-px4.",
+    )
+    parser.add_argument(
+        "--manual-px4-param-vertical-speed-limit-mps",
+        type=float,
+        default=80.0,
+        help="Runtime PX4 vertical speed parameter used by manual-px4.",
     )
     parser.add_argument(
         "--route-acceptance-m",
