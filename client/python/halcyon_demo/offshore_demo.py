@@ -599,8 +599,10 @@ class OffshorePreview:
         video_fps: float = 0.0,
         coordinate_diagnostics: bool = False,
         front_camera_stabilized: bool = False,
+        route_overlay: Optional[Sequence[RoutePoint]] = None,
     ):
         self.state = state
+        self.route_overlay = list(route_overlay) if route_overlay is not None else list(state.route)
         self.window_name = window_name
         self.width = width
         self.height = height
@@ -627,8 +629,8 @@ class OffshorePreview:
         self.camera_epoch_seen = state.snapshot()["camera_epoch"]
         self.waiting_for_fresh_fpv = False
 
-        xs = [point.position[0] for point in self.state.route]
-        ys = [point.position[1] for point in self.state.route]
+        xs = [point.position[0] for point in self.route_overlay]
+        ys = [point.position[1] for point in self.route_overlay]
         self.map_min_x = min(xs)
         self.map_max_x = max(xs)
         self.map_min_y = min(ys)
@@ -951,21 +953,21 @@ class OffshorePreview:
         )
         self.draw_text(cv2, frame, "Route", (origin_x, origin_y - 8), scale=0.43)
 
-        route_pixels = [to_px(point.position) for point in self.state.route]
+        route_pixels = [to_px(point.position) for point in self.route_overlay]
         for start, end in zip(route_pixels, route_pixels[1:]):
             cv2.line(frame, start, end, (255, 0, 0), 2, cv2.LINE_AA)
 
         snapshot = self.state.snapshot()
-        for index, point in enumerate(self.state.route):
+        for point in self.route_overlay:
             color = (0, 0, 255)
             radius = max(3, int(map_size * 0.018))
-            if index == snapshot["current_index"]:
-                color = (0, 210, 255)
-                radius = max(4, int(map_size * 0.024))
-            elif index == snapshot["target_index"]:
-                color = (0, 255, 255)
-                radius = max(4, int(map_size * 0.024))
             cv2.circle(frame, to_px(point.position), radius, color, -1, cv2.LINE_AA)
+
+        active_radius = max(4, int(map_size * 0.024))
+        current_point = self.state.route[snapshot["current_index"]]
+        target_point = self.state.route[snapshot["target_index"]]
+        cv2.circle(frame, to_px(current_point.position), active_radius, (0, 210, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, to_px(target_point.position), active_radius, (0, 255, 255), -1, cv2.LINE_AA)
 
         pos_px = to_px(snapshot["position"])
         cv2.drawMarker(
@@ -1513,11 +1515,19 @@ def make_runtime_scene_config(args, route: Sequence[RoutePoint]):
     return temp_dir, scene_name, str(temp_config_dir)
 
 
-def route_from_constants() -> List[RoutePoint]:
+def route_points_from_constants(route_constants) -> List[RoutePoint]:
     return [
         RoutePoint(label, [float(pos[0]), float(pos[1]), float(pos[2])], float(yaw_deg))
-        for label, pos, yaw_deg in OFFSHORE_ROUTE
+        for label, pos, yaw_deg in route_constants
     ]
+
+
+def route_from_constants() -> List[RoutePoint]:
+    return route_points_from_constants(OFFSHORE_ROUTE)
+
+
+def full_route_from_constants() -> List[RoutePoint]:
+    return route_points_from_constants(globals().get("FULL_OFFSHORE_ROUTE", OFFSHORE_ROUTE))
 
 
 def nearest_valid_planner_point(
@@ -3099,6 +3109,7 @@ async def run_demo(args):
             video_fps=args.video_fps,
             coordinate_diagnostics=args.coordinate_diagnostics,
             front_camera_stabilized=args.gimbal,
+            route_overlay=full_route_from_constants(),
         )
         preview.start()
         client.subscribe(fpv_topic, preview.receive_fpv)
