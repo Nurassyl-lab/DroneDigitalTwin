@@ -133,6 +133,16 @@ CHASE_MAX_CAMERA_OFFSET_M = 13.0
 BATTERY_START_LABEL = "Mission Start"
 BATTERY_SECONDS_PER_PERCENT = 0.4 * 60.0
 COVERAGE_UNFEASIBLE_HOLD_SEC = 2.0
+INSPECTION_TARGET_OBJECT = "Blade1_Object1"
+INSPECTION_NORMAL_OBJECT = "Blade1_Normal1"
+INSPECTION_ROOT_OBJECT = "Blade1_Root"
+INSPECTION_TIP_OBJECT = "Blade1_Tip"
+INSPECTION_DEFAULT_RADIUS_M = 5.0
+INSPECTION_DEFAULT_PASS_THRESHOLD = 0.80
+INSPECTION_DEFAULT_WEIGHTS = (0.20, 0.25, 0.30, 0.25)
+INSPECTION_STABILITY_WINDOW_SEC = 1.0
+INSPECTION_STABILITY_MAX_JITTER_NORM = 0.035
+INSPECTION_VISUAL_FULL_AREA_RATIO = 0.012
 WARNED_UNAVAILABLE = set()
 
 
@@ -341,6 +351,62 @@ def vector_length(values: Sequence[float]) -> float:
     return math.sqrt(sum(float(value) * float(value) for value in values))
 
 
+def vector_subtract(a: Sequence[float], b: Sequence[float]) -> List[float]:
+    return [float(a[index]) - float(b[index]) for index in range(3)]
+
+
+def vector_dot(a: Sequence[float], b: Sequence[float]) -> float:
+    return sum(float(a[index]) * float(b[index]) for index in range(3))
+
+
+def normalized_vector(values: Sequence[float]) -> Optional[List[float]]:
+    length = vector_length(values)
+    if length <= 1e-9:
+        return None
+    return [float(value) / length for value in values]
+
+
+def angle_between_vectors_deg(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
+    unit_a = normalized_vector(a)
+    unit_b = normalized_vector(b)
+    if unit_a is None or unit_b is None:
+        return None
+    dot = clamp(vector_dot(unit_a, unit_b), -1.0, 1.0)
+    return math.degrees(math.acos(dot))
+
+
+def span_percent_along_blade(
+    target: Sequence[float],
+    root: Sequence[float],
+    tip: Sequence[float],
+) -> Optional[float]:
+    root_to_tip = vector_subtract(tip, root)
+    length_sq = vector_dot(root_to_tip, root_to_tip)
+    if length_sq <= 1e-9:
+        return None
+    root_to_target = vector_subtract(target, root)
+    fraction = clamp(vector_dot(root_to_target, root_to_tip) / length_sq, 0.0, 1.0)
+    return 100.0 * fraction
+
+
+def parse_inspection_confidence_weights(value: str) -> Tuple[float, float, float, float]:
+    parts = value.replace(",", " ").split()
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError(
+            "Expected four weights: distance,angle,visual,stability"
+        )
+    try:
+        weights = tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Inspection confidence weights must be numeric") from exc
+    if any(weight < 0.0 for weight in weights):
+        raise argparse.ArgumentTypeError("Inspection confidence weights must be non-negative")
+    total = sum(weights)
+    if total <= 1e-9:
+        raise argparse.ArgumentTypeError("At least one inspection confidence weight must be positive")
+    return tuple(weight / total for weight in weights)
+
+
 def get_ground_truth_velocity_ned(drone: Drone) -> List[float]:
     twist = drone.get_ground_truth_kinematics().get("twist", {})
     linear = twist.get("linear", {})
@@ -408,6 +474,11 @@ class DemoState:
         self.last_requested_position = list(self.route[0].position)
         self.last_requested_yaw_deg = self.route[0].yaw_deg
         self.diagnostics = {}
+        self.fpv_camera_position = None
+        self.inspection = {
+            "active": False,
+            "status": "outside",
+        }
         self.mode = "teleport"
         self.mode_detail = "manual teleport mode"
         self.auto_flight_running = False
@@ -436,6 +507,12 @@ class DemoState:
                 "last_requested_position": list(self.last_requested_position),
                 "last_requested_yaw_deg": self.last_requested_yaw_deg,
                 "diagnostics": dict(self.diagnostics),
+                "fpv_camera_position": (
+                    list(self.fpv_camera_position)
+                    if self.fpv_camera_position is not None
+                    else None
+                ),
+                "inspection": dict(self.inspection),
                 "mode": self.mode,
                 "mode_detail": self.mode_detail,
                 "auto_flight_running": self.auto_flight_running,
@@ -559,6 +636,28 @@ class DemoState:
                 extra = f"{width}x{height}"
         self.update_diagnostic(name, position, yaw_deg, extra)
 
+    def update_fpv_camera_position(self, position: Optional[Sequence[float]]):
+        if position is None:
+            return
+        with self.lock:
+            self.fpv_camera_position = [
+                float(position[0]),
+                float(position[1]),
+                float(position[2]),
+            ]
+
+    def update_inspection_geometry(self, inspection: Dict):
+        with self.lock:
+            self.inspection = dict(inspection)
+
+    def clear_inspection_geometry(self, status: str = "outside"):
+        with self.lock:
+            self.inspection = {
+                "active": False,
+                "status": status,
+                "time": time.time(),
+            }
+
     def bump_camera_epoch(self):
         with self.lock:
             self.camera_epoch += 1
@@ -600,6 +699,8 @@ class OffshorePreview:
         coordinate_diagnostics: bool = False,
         front_camera_stabilized: bool = False,
         route_overlay: Optional[Sequence[RoutePoint]] = None,
+        inspection_weights: Sequence[float] = INSPECTION_DEFAULT_WEIGHTS,
+        inspection_pass_threshold: float = INSPECTION_DEFAULT_PASS_THRESHOLD,
     ):
         self.state = state
         self.route_overlay = list(route_overlay) if route_overlay is not None else list(state.route)
@@ -610,6 +711,9 @@ class OffshorePreview:
         self.max_fps = max(1.0, max_fps)
         self.coordinate_diagnostics = bool(coordinate_diagnostics)
         self.front_camera_stabilized = bool(front_camera_stabilized)
+        self.inspection_weights = tuple(float(weight) for weight in inspection_weights)
+        self.inspection_pass_threshold = clamp(float(inspection_pass_threshold), 0.0, 1.0)
+        self.inspection_centroid_history = []
         self.record_video = bool(record_video)
         self.video_dir = Path(video_dir) if video_dir is not None else VIDEO_DIR
         self.video_fps = self.max_fps if video_fps <= 0.0 else max(1.0, video_fps)
@@ -718,6 +822,7 @@ class OffshorePreview:
             "FPV camera msg",
         ):
             return
+        self.state.update_fpv_camera_position(image_pose_position(image))
         self._push_latest(self.fpv_images, image)
 
     def receive_chase(self, _, image):
@@ -845,6 +950,7 @@ class OffshorePreview:
                 if self.coordinate_diagnostics:
                     self.draw_diagnostics(cv2, frame)
                 self.draw_battery(cv2, frame)
+                self.draw_inspection_confidence(cv2, frame)
                 self.draw_coverage_unfeasible(cv2, frame)
 
                 if not created:
@@ -1050,6 +1156,137 @@ class OffshorePreview:
         blue = (255, 190, 60)
         cv2.circle(frame, center, radius, blue, 1, cv2.LINE_AA)
         cv2.arrowedLine(frame, start, end, blue, 2, cv2.LINE_AA, tipLength=0.35)
+
+    def detect_red_inspection_target(self, cv2, frame) -> Dict:
+        import numpy as np
+
+        height, width = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lower_red_a = np.array([0, 80, 70], dtype=np.uint8)
+        upper_red_a = np.array([12, 255, 255], dtype=np.uint8)
+        lower_red_b = np.array([170, 80, 70], dtype=np.uint8)
+        upper_red_b = np.array([180, 255, 255], dtype=np.uint8)
+        mask = cv2.bitwise_or(
+            cv2.inRange(hsv, lower_red_a, upper_red_a),
+            cv2.inRange(hsv, lower_red_b, upper_red_b),
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = max(10.0, width * height * 0.00003)
+        if not contours:
+            return {"score": 0.0, "centroid": None, "area_ratio": 0.0}
+
+        contour = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(contour))
+        if area < min_area:
+            return {"score": 0.0, "centroid": None, "area_ratio": area / (width * height)}
+
+        moments = cv2.moments(contour)
+        if abs(moments["m00"]) <= 1e-9:
+            centroid = None
+        else:
+            centroid = (
+                float(moments["m10"] / moments["m00"]) / width,
+                float(moments["m01"] / moments["m00"]) / height,
+            )
+        area_ratio = area / float(width * height)
+        size_score = clamp(area_ratio / INSPECTION_VISUAL_FULL_AREA_RATIO, 0.0, 1.0)
+        visual_score = clamp(0.25 + 0.75 * size_score, 0.0, 1.0)
+        return {"score": visual_score, "centroid": centroid, "area_ratio": area_ratio}
+
+    def update_inspection_stability(self, centroid: Optional[Tuple[float, float]]) -> Optional[float]:
+        now = time.monotonic()
+        if centroid is not None:
+            self.inspection_centroid_history.append((now, centroid[0], centroid[1]))
+        cutoff = now - INSPECTION_STABILITY_WINDOW_SEC
+        self.inspection_centroid_history = [
+            sample for sample in self.inspection_centroid_history if sample[0] >= cutoff
+        ]
+        if len(self.inspection_centroid_history) < 3:
+            return None
+
+        mean_x = sum(sample[1] for sample in self.inspection_centroid_history) / len(
+            self.inspection_centroid_history
+        )
+        mean_y = sum(sample[2] for sample in self.inspection_centroid_history) / len(
+            self.inspection_centroid_history
+        )
+        jitter = math.sqrt(
+            sum(
+                (sample[1] - mean_x) * (sample[1] - mean_x)
+                + (sample[2] - mean_y) * (sample[2] - mean_y)
+                for sample in self.inspection_centroid_history
+            )
+            / len(self.inspection_centroid_history)
+        )
+        return clamp(1.0 - jitter / INSPECTION_STABILITY_MAX_JITTER_NORM, 0.0, 1.0)
+
+    def draw_inspection_confidence(self, cv2, frame):
+        snapshot = self.state.snapshot()
+        inspection = snapshot.get("inspection", {})
+        if not inspection.get("active"):
+            self.inspection_centroid_history.clear()
+            return
+
+        visual = self.detect_red_inspection_target(cv2, frame)
+        stability_score = self.update_inspection_stability(visual["centroid"])
+        stability_for_confidence = 0.5 if stability_score is None else stability_score
+        distance_score = float(inspection.get("distance_score", 0.0))
+        angle_score = float(inspection.get("viewing_angle_score", 0.0))
+        visual_score = float(visual["score"])
+        weights = self.inspection_weights
+        confidence = clamp(
+            weights[0] * distance_score
+            + weights[1] * angle_score
+            + weights[2] * visual_score
+            + weights[3] * stability_for_confidence,
+            0.0,
+            1.0,
+        )
+        result = "PASS" if confidence >= self.inspection_pass_threshold else "FAIL"
+        stable_text = "..." if stability_score is None else f"{stability_score:.2f}"
+        span_percent = inspection.get("span_percent")
+        span_text = "n/a" if span_percent is None else f"{float(span_percent):.0f}%"
+
+        lines = [
+            "INSPECTION",
+            str(inspection.get("target_name", INSPECTION_TARGET_OBJECT)),
+            f"DIST   {float(inspection.get('distance_m', 0.0)):.1f} m",
+            f"ANGLE  {float(inspection.get('angle_deg', 0.0)):.1f} deg",
+            f"VISUAL {visual_score:.2f}",
+            f"STABLE {stable_text}",
+            f"SPAN   {span_text}",
+            "----------------",
+            f"CONF   {confidence:.2f} {result}",
+        ]
+
+        height, width = frame.shape[:2]
+        compact = width <= 800 or height <= 650
+        scale = 0.38 if compact else 0.44
+        line_h = 16 if compact else 19
+        panel_w = 210 if compact else 245
+        panel_h = 18 + line_h * len(lines)
+        x0 = max(18, width - panel_w - 16)
+        y0 = max(18, height - panel_h - 16)
+        x1 = min(width - 12, x0 + panel_w)
+        y1 = min(height - 12, y0 + panel_h)
+
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (18, 18, 18), -1)
+        cv2.addWeighted(overlay, 0.70, frame, 0.30, 0.0, frame)
+        cv2.rectangle(frame, (x0, y0), (x1, y1), (180, 180, 180), 1)
+
+        y = y0 + line_h
+        for index, line in enumerate(lines):
+            color = (255, 255, 255)
+            if index == 0:
+                color = (80, 220, 255)
+            elif line.startswith("CONF"):
+                color = (90, 240, 90) if result == "PASS" else (0, 0, 255)
+            self.draw_text(cv2, frame, line, (x0 + 10, y), scale=scale, color=color)
+            y += line_h
 
     def draw_battery(self, cv2, frame):
         snapshot = self.state.snapshot()
@@ -1944,6 +2181,73 @@ def safe_call(label: str, fn):
             projectairsim_log().warning("%s unavailable: %s", label, exc)
             WARNED_UNAVAILABLE.add(label)
         return None
+
+
+def update_inspection_geometry(
+    world: Optional[World],
+    state: DemoState,
+    args,
+    camera_position: Sequence[float],
+):
+    if world is None:
+        state.clear_inspection_geometry("no world")
+        return
+
+    object_names = [
+        INSPECTION_TARGET_OBJECT,
+        INSPECTION_NORMAL_OBJECT,
+        INSPECTION_ROOT_OBJECT,
+        INSPECTION_TIP_OBJECT,
+    ]
+    object_poses = safe_call(
+        "Inspection object poses",
+        lambda: world.get_object_poses(object_names),
+    )
+    if not object_poses or len(object_poses) != len(object_names):
+        state.clear_inspection_geometry("objects unavailable")
+        return
+
+    positions = [extract_pose_position(pose) for pose in object_poses]
+    if any(position is None for position in positions):
+        state.clear_inspection_geometry("objects unavailable")
+        return
+
+    target_position, normal_position, root_position, tip_position = positions
+    radius_m = max(0.1, float(args.inspection_radius_m))
+    distance_m = distance_between(camera_position, target_position)
+    if distance_m > radius_m:
+        state.clear_inspection_geometry("outside")
+        return
+
+    surface_normal = vector_subtract(normal_position, target_position)
+    view_direction = vector_subtract(camera_position, target_position)
+    angle_deg = angle_between_vectors_deg(surface_normal, view_direction)
+    if angle_deg is None:
+        viewing_angle_score = 0.0
+        angle_deg = 180.0
+    else:
+        viewing_angle_score = clamp(1.0 - angle_deg / 90.0, 0.0, 1.0)
+
+    distance_score = clamp(1.0 - distance_m / radius_m, 0.0, 1.0)
+    state.update_inspection_geometry(
+        {
+            "active": True,
+            "status": "inside",
+            "target_name": INSPECTION_TARGET_OBJECT,
+            "target_position": list(target_position),
+            "camera_position": list(camera_position),
+            "distance_m": float(distance_m),
+            "angle_deg": float(angle_deg),
+            "distance_score": float(distance_score),
+            "viewing_angle_score": float(viewing_angle_score),
+            "span_percent": span_percent_along_blade(
+                target_position,
+                root_position,
+                tip_position,
+            ),
+            "time": time.time(),
+        }
+    )
 
 
 def update_drone_diagnostics(
@@ -2958,6 +3262,7 @@ async def run_teleport_viewer(
     projectairsim_log().info("Interactive mode active. Press e/r/t for teleport controls.")
     last_report_at = 0.0
     last_diagnostics_at = 0.0
+    last_inspection_at = 0.0
     auto_flight_task = (
         asyncio.create_task(run_route_auto_flight(drone, state, args, world))
         if start_auto_flight
@@ -2979,6 +3284,12 @@ async def run_teleport_viewer(
                 state.set_route_index(nearest_route_index(state.route, current))
 
             now = time.time()
+            if now - last_inspection_at >= 1.0 / max(0.1, float(args.inspection_update_hz)):
+                snapshot = state.snapshot()
+                camera_position = snapshot.get("fpv_camera_position") or current_ned
+                update_inspection_geometry(world, state, args, camera_position)
+                last_inspection_at = now
+
             if now - last_diagnostics_at >= 0.5:
                 update_drone_diagnostics(drone, state, world, args.drone_name)
                 last_diagnostics_at = now
@@ -3110,6 +3421,8 @@ async def run_demo(args):
             coordinate_diagnostics=args.coordinate_diagnostics,
             front_camera_stabilized=args.gimbal,
             route_overlay=full_route_from_constants(),
+            inspection_weights=args.inspection_confidence_weights,
+            inspection_pass_threshold=args.inspection_pass_threshold,
         )
         preview.start()
         client.subscribe(fpv_topic, preview.receive_fpv)
@@ -3562,6 +3875,33 @@ def build_parser():
         "--coordinate-diagnostics",
         action="store_true",
         help="Draw the coordinate diagnostics table in the FPV preview.",
+    )
+    parser.add_argument(
+        "--inspection-radius-m",
+        type=float,
+        default=INSPECTION_DEFAULT_RADIUS_M,
+        help="Distance from FrontCamera to Blade1_Object1 that enables the inspection panel.",
+    )
+    parser.add_argument(
+        "--inspection-update-hz",
+        type=float,
+        default=10.0,
+        help="How often to update inspection distance/angle geometry.",
+    )
+    parser.add_argument(
+        "--inspection-pass-threshold",
+        type=float,
+        default=INSPECTION_DEFAULT_PASS_THRESHOLD,
+        help="Rule-based inspection confidence score required for PASS.",
+    )
+    parser.add_argument(
+        "--inspection-confidence-weights",
+        type=parse_inspection_confidence_weights,
+        default=INSPECTION_DEFAULT_WEIGHTS,
+        help=(
+            "Four weights for distance,angle,visual,stability. "
+            "Example: 0.20,0.25,0.30,0.25"
+        ),
     )
     parser.add_argument(
         "--wind",
