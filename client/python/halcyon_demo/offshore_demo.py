@@ -1230,16 +1230,27 @@ class OffshorePreview:
     def draw_inspection_confidence(self, cv2, frame):
         snapshot = self.state.snapshot()
         inspection = snapshot.get("inspection", {})
-        if not inspection.get("active"):
+        target_position = inspection.get("target_position")
+        drone_position = inspection.get("drone_position")
+        camera_position = inspection.get("camera_position")
+        if target_position is None or drone_position is None:
             self.inspection_centroid_history.clear()
             return
 
-        visual = self.detect_red_inspection_target(cv2, frame)
-        stability_score = self.update_inspection_stability(visual["centroid"])
-        stability_for_confidence = 0.5 if stability_score is None else stability_score
+        active = bool(inspection.get("active"))
+        if active:
+            visual = self.detect_red_inspection_target(cv2, frame)
+            stability_score = self.update_inspection_stability(visual["centroid"])
+            stability_for_confidence = 0.5 if stability_score is None else stability_score
+            visual_score = float(visual["score"])
+        else:
+            self.inspection_centroid_history.clear()
+            stability_score = None
+            stability_for_confidence = 0.0
+            visual_score = 0.0
+
         distance_score = float(inspection.get("distance_score", 0.0))
         angle_score = float(inspection.get("viewing_angle_score", 0.0))
-        visual_score = float(visual["score"])
         weights = self.inspection_weights
         confidence = clamp(
             weights[0] * distance_score
@@ -1250,27 +1261,44 @@ class OffshorePreview:
             1.0,
         )
         result = "PASS" if confidence >= self.inspection_pass_threshold else "FAIL"
-        stable_text = "..." if stability_score is None else f"{stability_score:.2f}"
+        stable_text = "n/a" if not active else "..." if stability_score is None else f"{stability_score:.2f}"
         span_percent = inspection.get("span_percent")
         span_text = "n/a" if span_percent is None else f"{float(span_percent):.0f}%"
+        confidence_text = f"{confidence:.2f} {result}" if active else "n/a outside radius"
+        camera_distance_m = inspection.get("camera_distance_m", inspection.get("distance_m", 0.0))
 
         lines = [
             "INSPECTION",
             str(inspection.get("target_name", INSPECTION_TARGET_OBJECT)),
-            f"DIST   {float(inspection.get('distance_m', 0.0)):.1f} m",
+            (
+                f"OBJ    {target_position[0]:.1f}, "
+                f"{target_position[1]:.1f}, {target_position[2]:.1f}"
+            ),
+            (
+                f"DRONE  {drone_position[0]:.1f}, "
+                f"{drone_position[1]:.1f}, {drone_position[2]:.1f}"
+            ),
+            (
+                f"CAM    {camera_position[0]:.1f}, "
+                f"{camera_position[1]:.1f}, {camera_position[2]:.1f}"
+                if camera_position is not None
+                else "CAM    n/a"
+            ),
+            f"DRONE-DIST {float(inspection.get('drone_distance_m', 0.0)):.1f} m",
+            f"CAM-DIST   {float(camera_distance_m):.1f} m",
             f"ANGLE  {float(inspection.get('angle_deg', 0.0)):.1f} deg",
             f"VISUAL {visual_score:.2f}",
             f"STABLE {stable_text}",
             f"SPAN   {span_text}",
             "----------------",
-            f"CONF   {confidence:.2f} {result}",
+            f"CONF   {confidence_text}",
         ]
 
         height, width = frame.shape[:2]
         compact = width <= 800 or height <= 650
         scale = 0.38 if compact else 0.44
         line_h = 16 if compact else 19
-        panel_w = 210 if compact else 245
+        panel_w = 280 if compact else 330
         panel_h = 18 + line_h * len(lines)
         x0 = max(18, width - panel_w - 16)
         y0 = max(18, height - panel_h - 16)
@@ -2205,6 +2233,7 @@ def update_inspection_geometry(
     state: DemoState,
     args,
     camera_position: Sequence[float],
+    drone_position: Sequence[float],
 ):
     if world is None:
         state.clear_inspection_geometry("no world")
@@ -2231,10 +2260,9 @@ def update_inspection_geometry(
 
     target_position, normal_position, root_position, tip_position = positions
     radius_m = max(0.1, float(args.inspection_radius_m))
-    distance_m = distance_between(camera_position, target_position)
-    if distance_m > radius_m:
-        state.clear_inspection_geometry("outside")
-        return
+    camera_distance_m = distance_between(camera_position, target_position)
+    drone_distance_m = distance_between(drone_position, target_position)
+    active = camera_distance_m <= radius_m
 
     surface_normal = vector_subtract(normal_position, target_position)
     view_direction = vector_subtract(camera_position, target_position)
@@ -2245,15 +2273,18 @@ def update_inspection_geometry(
     else:
         viewing_angle_score = clamp(1.0 - angle_deg / 90.0, 0.0, 1.0)
 
-    distance_score = clamp(1.0 - distance_m / radius_m, 0.0, 1.0)
+    distance_score = clamp(1.0 - camera_distance_m / radius_m, 0.0, 1.0)
     state.update_inspection_geometry(
         {
-            "active": True,
-            "status": "inside",
+            "active": active,
+            "status": "inside" if active else "outside",
             "target_name": INSPECTION_TARGET_OBJECT,
             "target_position": list(target_position),
+            "drone_position": list(drone_position),
             "camera_position": list(camera_position),
-            "distance_m": float(distance_m),
+            "distance_m": float(camera_distance_m),
+            "camera_distance_m": float(camera_distance_m),
+            "drone_distance_m": float(drone_distance_m),
             "angle_deg": float(angle_deg),
             "distance_score": float(distance_score),
             "viewing_angle_score": float(viewing_angle_score),
@@ -3618,7 +3649,7 @@ async def run_teleport_viewer(
             if now - last_inspection_at >= 1.0 / max(0.1, float(args.inspection_update_hz)):
                 snapshot = state.snapshot()
                 camera_position = snapshot.get("fpv_camera_position") or current_ned
-                update_inspection_geometry(world, state, args, camera_position)
+                update_inspection_geometry(world, state, args, camera_position, current_ned)
                 last_inspection_at = now
 
             if now - last_diagnostics_at >= 0.5:
