@@ -408,3 +408,5 @@ unreal/OffShoreWindFarm/
 wind_data/
 get_wind.py
 inspect_wrf_grid.py
+client/python/halcyon_demo/video/
+unreal/OffShoreWindFarm.zip
