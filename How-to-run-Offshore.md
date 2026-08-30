@@ -39,3 +39,11 @@ Keyboard controls:
 ### How to run autoflight?
 `python offshore_demo.py --mode-flight auto-flight --route-speed-mps 4 --slowdown-distance-m 15 --video`
 use `--wind` to simulate real wind from WRF data.
+
+
+### Wind turbine defect detection
+- img of a crack is a decal object
+- object detection depends on the Blade1_Object1 (but it is hidden in play mode)
+```python
+python offshore_demo.py --mode-flight manual-direct --route-speed-mps 4 --gimbal --camera-width 1280 --camera-height 720 --preview-width 1280 --preview-height 720 --wind --battery-start-percent 100
+```

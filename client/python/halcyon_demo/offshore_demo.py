@@ -150,8 +150,14 @@ INSPECTION_DEFAULT_PASS_THRESHOLD = 0.80
 INSPECTION_DEFAULT_WEIGHTS = (0.20, 0.25, 0.30, 0.25)
 INSPECTION_STABILITY_WINDOW_SEC = 1.0
 INSPECTION_STABILITY_MAX_JITTER_NORM = 0.035
-INSPECTION_VISUAL_FULL_AREA_RATIO = 0.012
 INSPECTION_SPHERE_BASE_DIAMETER_M = 1.0
+INSPECTION_REGION_WIDTH_M = 0.5
+INSPECTION_REGION_HEIGHT_M = 0.5
+INSPECTION_GOOD_FOOTPRINT_PX = 48.0
+INSPECTION_FRAME_COMFORT_MARGIN_FRACTION = 0.12
+INSPECTION_SHARPNESS_MIN_VARIANCE = 40.0
+INSPECTION_SHARPNESS_GOOD_VARIANCE = 180.0
+INSPECTION_VISUAL_DEBUG_INTERVAL_SEC = 1.0
 WARNED_UNAVAILABLE = set()
 
 
@@ -383,6 +389,14 @@ def vector_dot(a: Sequence[float], b: Sequence[float]) -> float:
     return sum(float(a[index]) * float(b[index]) for index in range(3))
 
 
+def vector_cross(a: Sequence[float], b: Sequence[float]) -> List[float]:
+    return [
+        float(a[1]) * float(b[2]) - float(a[2]) * float(b[1]),
+        float(a[2]) * float(b[0]) - float(a[0]) * float(b[2]),
+        float(a[0]) * float(b[1]) - float(a[1]) * float(b[0]),
+    ]
+
+
 def normalized_vector(values: Sequence[float]) -> Optional[List[float]]:
     length = vector_length(values)
     if length <= 1e-9:
@@ -428,6 +442,100 @@ def sphere_size_from_scale(
     return diameter_m, surface_area_m2
 
 
+def finite_quaternion_from_mapping(value) -> Optional[List[float]]:
+    if not isinstance(value, dict):
+        return None
+    try:
+        quaternion = [
+            float(value["w"]),
+            float(value["x"]),
+            float(value["y"]),
+            float(value["z"]),
+        ]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(component) for component in quaternion):
+        return None
+    return quaternion
+
+
+def normalized_quaternion(quaternion: Sequence[float]) -> Optional[List[float]]:
+    try:
+        result = [float(quaternion[index]) for index in range(4)]
+    except (IndexError, TypeError, ValueError):
+        return None
+    norm = math.sqrt(sum(component * component for component in result))
+    if norm <= 1e-9 or not math.isfinite(norm):
+        return None
+    return [component / norm for component in result]
+
+
+def quaternion_conjugate(quaternion: Sequence[float]) -> List[float]:
+    return [
+        float(quaternion[0]),
+        -float(quaternion[1]),
+        -float(quaternion[2]),
+        -float(quaternion[3]),
+    ]
+
+
+def quaternion_rotate_vector(
+    quaternion: Sequence[float],
+    vector: Sequence[float],
+) -> List[float]:
+    q = normalized_quaternion(quaternion)
+    if q is None:
+        return [float(vector[0]), float(vector[1]), float(vector[2])]
+    w = q[0]
+    q_vec = [q[1], q[2], q[3]]
+    v = [float(vector[0]), float(vector[1]), float(vector[2])]
+    first_cross = vector_cross(q_vec, v)
+    second_cross = vector_cross(q_vec, first_cross)
+    return [
+        v[index] + 2.0 * (w * first_cross[index] + second_cross[index])
+        for index in range(3)
+    ]
+
+
+def project_ned_point_to_camera_pixel(
+    target_position: Sequence[float],
+    camera_position: Sequence[float],
+    camera_rotation: Sequence[float],
+    horizontal_fov_degrees: float,
+    image_width: int,
+    image_height: int,
+) -> Optional[Dict]:
+    target = finite_vector(target_position)
+    camera = finite_vector(camera_position)
+    rotation = normalized_quaternion(camera_rotation)
+    if target is None or camera is None or rotation is None:
+        return None
+
+    width = max(1, int(image_width))
+    height = max(1, int(image_height))
+    offset_world = vector_subtract(target, camera)
+    offset_camera = quaternion_rotate_vector(quaternion_conjugate(rotation), offset_world)
+    depth_m = float(offset_camera[0])
+    if depth_m <= 1e-6:
+        return {
+            "pixel": None,
+            "depth_m": depth_m,
+            "in_front": False,
+            "focal_px": None,
+        }
+
+    fov_rad = math.radians(clamp(float(horizontal_fov_degrees), 1.0, 179.0))
+    focal_px = width / (2.0 * math.tan(fov_rad / 2.0))
+    pixel_x = (width - 1) * 0.5 + (float(offset_camera[1]) / depth_m) * focal_px
+    pixel_y = (height - 1) * 0.5 + (float(offset_camera[2]) / depth_m) * focal_px
+    return {
+        "pixel": (pixel_x, pixel_y),
+        "depth_m": depth_m,
+        "in_front": True,
+        "focal_px": focal_px,
+    }
+
+
 def parse_inspection_confidence_weights(value: str) -> Tuple[float, float, float, float]:
     parts = value.replace(",", " ").split()
     if len(parts) != 4:
@@ -463,9 +571,41 @@ def image_pose_position(image) -> Optional[List[float]]:
     if not all(key in image for key in keys):
         return None
     try:
-        return [float(image["pos_x"]), float(image["pos_y"]), float(image["pos_z"])]
+        position = [float(image["pos_x"]), float(image["pos_y"]), float(image["pos_z"])]
     except (TypeError, ValueError):
         return None
+    if not all(math.isfinite(component) for component in position):
+        return None
+    return position
+
+
+def image_pose_rotation(image) -> Optional[List[float]]:
+    if not isinstance(image, dict):
+        return None
+    keys = ("rot_w", "rot_x", "rot_y", "rot_z")
+    if not all(key in image for key in keys):
+        return None
+    return finite_quaternion_from_mapping(
+        {
+            "w": image["rot_w"],
+            "x": image["rot_x"],
+            "y": image["rot_y"],
+            "z": image["rot_z"],
+        }
+    )
+
+
+def image_resolution(image) -> Optional[Tuple[int, int]]:
+    if not isinstance(image, dict):
+        return None
+    try:
+        width = int(image["width"])
+        height = int(image["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
 
 
 def image_pose_yaw_deg(image) -> Optional[float]:
@@ -514,6 +654,8 @@ class DemoState:
         self.last_requested_yaw_deg = self.route[0].yaw_deg
         self.diagnostics = {}
         self.fpv_camera_position = None
+        self.fpv_camera_rotation = None
+        self.fpv_camera_resolution = None
         self.inspection = {
             "active": False,
             "status": "outside",
@@ -549,6 +691,16 @@ class DemoState:
                 "fpv_camera_position": (
                     list(self.fpv_camera_position)
                     if self.fpv_camera_position is not None
+                    else None
+                ),
+                "fpv_camera_rotation": (
+                    list(self.fpv_camera_rotation)
+                    if self.fpv_camera_rotation is not None
+                    else None
+                ),
+                "fpv_camera_resolution": (
+                    list(self.fpv_camera_resolution)
+                    if self.fpv_camera_resolution is not None
                     else None
                 ),
                 "inspection": dict(self.inspection),
@@ -685,6 +837,32 @@ class DemoState:
                 float(position[2]),
             ]
 
+    def update_fpv_camera_pose(
+        self,
+        position: Optional[Sequence[float]],
+        rotation: Optional[Sequence[float]],
+        resolution: Optional[Sequence[int]] = None,
+    ):
+        with self.lock:
+            if position is not None:
+                self.fpv_camera_position = [
+                    float(position[0]),
+                    float(position[1]),
+                    float(position[2]),
+                ]
+            if rotation is not None:
+                self.fpv_camera_rotation = [
+                    float(rotation[0]),
+                    float(rotation[1]),
+                    float(rotation[2]),
+                    float(rotation[3]),
+                ]
+            if resolution is not None:
+                self.fpv_camera_resolution = [
+                    int(resolution[0]),
+                    int(resolution[1]),
+                ]
+
     def update_inspection_geometry(self, inspection: Dict):
         with self.lock:
             self.inspection = dict(inspection)
@@ -738,6 +916,13 @@ class OffshorePreview:
         coordinate_diagnostics: bool = False,
         front_camera_stabilized: bool = False,
         route_overlay: Optional[Sequence[RoutePoint]] = None,
+        camera_fov_degrees: float = 90.0,
+        inspection_region_width_m: float = INSPECTION_REGION_WIDTH_M,
+        inspection_region_height_m: float = INSPECTION_REGION_HEIGHT_M,
+        inspection_good_footprint_px: float = INSPECTION_GOOD_FOOTPRINT_PX,
+        inspection_frame_margin_fraction: float = INSPECTION_FRAME_COMFORT_MARGIN_FRACTION,
+        inspection_sharpness_min_variance: float = INSPECTION_SHARPNESS_MIN_VARIANCE,
+        inspection_sharpness_good_variance: float = INSPECTION_SHARPNESS_GOOD_VARIANCE,
         inspection_weights: Sequence[float] = INSPECTION_DEFAULT_WEIGHTS,
         inspection_pass_threshold: float = INSPECTION_DEFAULT_PASS_THRESHOLD,
     ):
@@ -750,9 +935,27 @@ class OffshorePreview:
         self.max_fps = max(1.0, max_fps)
         self.coordinate_diagnostics = bool(coordinate_diagnostics)
         self.front_camera_stabilized = bool(front_camera_stabilized)
+        self.camera_fov_degrees = float(camera_fov_degrees)
+        self.inspection_region_width_m = max(0.01, float(inspection_region_width_m))
+        self.inspection_region_height_m = max(0.01, float(inspection_region_height_m))
+        self.inspection_good_footprint_px = max(1.0, float(inspection_good_footprint_px))
+        self.inspection_frame_margin_fraction = clamp(
+            float(inspection_frame_margin_fraction),
+            0.01,
+            0.45,
+        )
+        self.inspection_sharpness_min_variance = max(
+            0.0,
+            float(inspection_sharpness_min_variance),
+        )
+        self.inspection_sharpness_good_variance = max(
+            self.inspection_sharpness_min_variance + 1e-6,
+            float(inspection_sharpness_good_variance),
+        )
         self.inspection_weights = tuple(float(weight) for weight in inspection_weights)
         self.inspection_pass_threshold = clamp(float(inspection_pass_threshold), 0.0, 1.0)
         self.inspection_centroid_history = []
+        self.last_visual_debug_at = 0.0
         self.record_video = bool(record_video)
         self.video_dir = Path(video_dir) if video_dir is not None else VIDEO_DIR
         self.video_fps = self.max_fps if video_fps <= 0.0 else max(1.0, video_fps)
@@ -861,7 +1064,11 @@ class OffshorePreview:
             "FPV camera msg",
         ):
             return
-        self.state.update_fpv_camera_position(image_pose_position(image))
+        self.state.update_fpv_camera_pose(
+            image_pose_position(image),
+            image_pose_rotation(image),
+            image_resolution(image),
+        )
         self._push_latest(self.fpv_images, image)
 
     def receive_chase(self, _, image):
@@ -1194,44 +1401,187 @@ class OffshorePreview:
         cv2.circle(frame, center, radius, blue, 1, cv2.LINE_AA)
         cv2.arrowedLine(frame, start, end, blue, 2, cv2.LINE_AA, tipLength=0.35)
 
-    def detect_red_inspection_target(self, cv2, frame) -> Dict:
-        import numpy as np
-
+    def score_projected_inspection_target(
+        self,
+        cv2,
+        frame,
+        target_position: Sequence[float],
+        camera_position: Optional[Sequence[float]],
+        camera_rotation: Optional[Sequence[float]],
+        camera_resolution: Optional[Sequence[int]],
+    ) -> Dict:
         height, width = frame.shape[:2]
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower_red_a = np.array([0, 80, 70], dtype=np.uint8)
-        upper_red_a = np.array([12, 255, 255], dtype=np.uint8)
-        lower_red_b = np.array([170, 80, 70], dtype=np.uint8)
-        upper_red_b = np.array([180, 255, 255], dtype=np.uint8)
-        mask = cv2.bitwise_or(
-            cv2.inRange(hsv, lower_red_a, upper_red_a),
-            cv2.inRange(hsv, lower_red_b, upper_red_b),
-        )
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        min_area = max(10.0, width * height * 0.00003)
-        if not contours:
-            return {"score": 0.0, "centroid": None, "area_ratio": 0.0}
-
-        contour = max(contours, key=cv2.contourArea)
-        area = float(cv2.contourArea(contour))
-        if area < min_area:
-            return {"score": 0.0, "centroid": None, "area_ratio": area / (width * height)}
-
-        moments = cv2.moments(contour)
-        if abs(moments["m00"]) <= 1e-9:
-            centroid = None
+        if camera_resolution is None:
+            source_width, source_height = width, height
         else:
-            centroid = (
-                float(moments["m10"] / moments["m00"]) / width,
-                float(moments["m01"] / moments["m00"]) / height,
+            source_width = max(1, int(camera_resolution[0]))
+            source_height = max(1, int(camera_resolution[1]))
+        projection = project_ned_point_to_camera_pixel(
+            target_position,
+            camera_position,
+            camera_rotation,
+            self.camera_fov_degrees,
+            source_width,
+            source_height,
+        )
+        if projection is None:
+            result = {
+                "score": 0.0,
+                "centroid": None,
+                "projected_pixel": None,
+                "in_frame_score": 0.0,
+                "expected_width_px": 0.0,
+                "expected_height_px": 0.0,
+                "laplacian_variance": 0.0,
+                "sharpness_score": 0.0,
+            }
+            self.log_visual_debug(result)
+            return result
+
+        pixel = projection.get("pixel")
+        depth_m = float(projection.get("depth_m", 0.0))
+        focal_px = projection.get("focal_px")
+        if pixel is None or focal_px is None or depth_m <= 1e-6:
+            result = {
+                "score": 0.0,
+                "centroid": None,
+                "projected_pixel": None,
+                "in_frame_score": 0.0,
+                "expected_width_px": 0.0,
+                "expected_height_px": 0.0,
+                "laplacian_variance": 0.0,
+                "sharpness_score": 0.0,
+            }
+            self.log_visual_debug(result)
+            return result
+
+        source_pixel_x, source_pixel_y = pixel
+        scale_x = width / float(source_width)
+        scale_y = height / float(source_height)
+        pixel_x = source_pixel_x * scale_x
+        pixel_y = source_pixel_y * scale_y
+        border_distance_px = min(pixel_x, width - 1 - pixel_x, pixel_y, height - 1 - pixel_y)
+        comfort_margin_px = max(1.0, min(width, height) * self.inspection_frame_margin_fraction)
+        in_frame_score = clamp(border_distance_px / comfort_margin_px, 0.0, 1.0)
+
+        expected_width_px = (
+            float(focal_px) * self.inspection_region_width_m / depth_m * scale_x
+        )
+        expected_height_px = (
+            float(focal_px) * self.inspection_region_height_m / depth_m * scale_y
+        )
+        if in_frame_score <= 0.0:
+            apparent_size_score = 0.0
+            laplacian_variance = 0.0
+            sharpness_score = 0.0
+        else:
+            apparent_size_score = clamp(
+                min(expected_width_px, expected_height_px)
+                / self.inspection_good_footprint_px,
+                0.0,
+                1.0,
             )
-        area_ratio = area / float(width * height)
-        size_score = clamp(area_ratio / INSPECTION_VISUAL_FULL_AREA_RATIO, 0.0, 1.0)
-        visual_score = clamp(0.25 + 0.75 * size_score, 0.0, 1.0)
-        return {"score": visual_score, "centroid": centroid, "area_ratio": area_ratio}
+            laplacian_variance = self.laplacian_variance_near_pixel(
+                cv2,
+                frame,
+                pixel_x,
+                pixel_y,
+                expected_width_px,
+                expected_height_px,
+            )
+            sharpness_score = clamp(
+                (laplacian_variance - self.inspection_sharpness_min_variance)
+                / (
+                    self.inspection_sharpness_good_variance
+                    - self.inspection_sharpness_min_variance
+                ),
+                0.0,
+                1.0,
+            )
+        visual_score = clamp(
+            0.40 * in_frame_score
+            + 0.35 * apparent_size_score
+            + 0.25 * sharpness_score,
+            0.0,
+            1.0,
+        )
+        centroid = (
+            pixel_x / float(width),
+            pixel_y / float(height),
+        ) if in_frame_score > 0.0 else None
+        result = {
+            "score": visual_score,
+            "centroid": centroid,
+            "projected_pixel": (pixel_x, pixel_y),
+            "in_frame_score": in_frame_score,
+            "expected_width_px": expected_width_px,
+            "expected_height_px": expected_height_px,
+            "laplacian_variance": laplacian_variance,
+            "sharpness_score": sharpness_score,
+        }
+        self.log_visual_debug(result)
+        return result
+
+    def laplacian_variance_near_pixel(
+        self,
+        cv2,
+        frame,
+        pixel_x: float,
+        pixel_y: float,
+        expected_width_px: float,
+        expected_height_px: float,
+    ) -> float:
+        height, width = frame.shape[:2]
+        if pixel_x < 0.0 or pixel_x >= width or pixel_y < 0.0 or pixel_y >= height:
+            return 0.0
+
+        roi_w = int(
+            clamp(
+                max(24.0, expected_width_px * 1.5),
+                24.0,
+                max(24.0, width * 0.25),
+            )
+        )
+        roi_h = int(
+            clamp(
+                max(24.0, expected_height_px * 1.5),
+                24.0,
+                max(24.0, height * 0.25),
+            )
+        )
+        x0 = max(0, int(round(pixel_x - roi_w * 0.5)))
+        x1 = min(width, int(round(pixel_x + roi_w * 0.5)))
+        y0 = max(0, int(round(pixel_y - roi_h * 0.5)))
+        y1 = min(height, int(round(pixel_y + roi_h * 0.5)))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return 0.0
+
+        roi = frame[y0:y1, x0:x1]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def log_visual_debug(self, visual: Dict):
+        now = time.monotonic()
+        if now - self.last_visual_debug_at < INSPECTION_VISUAL_DEBUG_INTERVAL_SEC:
+            return
+        self.last_visual_debug_at = now
+        projected_pixel = visual.get("projected_pixel")
+        if projected_pixel is None:
+            pixel_text = "x=n/a y=n/a"
+        else:
+            pixel_text = f"x={projected_pixel[0]:.1f} y={projected_pixel[1]:.1f}"
+        projectairsim_log().info(
+            "visual_debug projected_pixel %s in_frame_score=%.2f "
+            "expected_width_px=%.1f expected_height_px=%.1f "
+            "laplacian_variance=%.1f sharpness_score=%.2f visual_score=%.2f",
+            pixel_text,
+            float(visual.get("in_frame_score", 0.0)),
+            float(visual.get("expected_width_px", 0.0)),
+            float(visual.get("expected_height_px", 0.0)),
+            float(visual.get("laplacian_variance", 0.0)),
+            float(visual.get("sharpness_score", 0.0)),
+            float(visual.get("score", 0.0)),
+        )
 
     def update_inspection_stability(self, centroid: Optional[Tuple[float, float]]) -> Optional[float]:
         now = time.monotonic()
@@ -1266,13 +1616,23 @@ class OffshorePreview:
         target_position = inspection.get("target_position")
         drone_position = inspection.get("drone_position")
         camera_position = inspection.get("camera_position")
+        score_camera_position = snapshot.get("fpv_camera_position") or camera_position
+        score_camera_rotation = snapshot.get("fpv_camera_rotation")
+        score_camera_resolution = snapshot.get("fpv_camera_resolution")
         if target_position is None or drone_position is None:
             self.inspection_centroid_history.clear()
             return
 
         active = bool(inspection.get("active"))
         if active:
-            visual = self.detect_red_inspection_target(cv2, frame)
+            visual = self.score_projected_inspection_target(
+                cv2,
+                frame,
+                target_position,
+                score_camera_position,
+                score_camera_rotation,
+                score_camera_resolution,
+            )
             stability_score = self.update_inspection_stability(visual["centroid"])
             stability_for_confidence = 0.5 if stability_score is None else stability_score
             visual_score = float(visual["score"])
@@ -3844,6 +4204,13 @@ async def run_demo(args):
             coordinate_diagnostics=args.coordinate_diagnostics,
             front_camera_stabilized=args.gimbal,
             route_overlay=full_route_from_constants(),
+            camera_fov_degrees=args.camera_fov_degrees,
+            inspection_region_width_m=args.inspection_region_width_m,
+            inspection_region_height_m=args.inspection_region_height_m,
+            inspection_good_footprint_px=args.inspection_good_footprint_px,
+            inspection_frame_margin_fraction=args.inspection_frame_margin_fraction,
+            inspection_sharpness_min_variance=args.inspection_sharpness_min_variance,
+            inspection_sharpness_good_variance=args.inspection_sharpness_good_variance,
             inspection_weights=args.inspection_confidence_weights,
             inspection_pass_threshold=args.inspection_pass_threshold,
         )
@@ -4429,6 +4796,42 @@ def build_parser():
             "Four weights for distance,angle,visual,stability. "
             "Example: 0.20,0.25,0.30,0.25"
         ),
+    )
+    parser.add_argument(
+        "--inspection-region-width-m",
+        type=float,
+        default=INSPECTION_REGION_WIDTH_M,
+        help="Physical width of the inspection target region used for visual footprint scoring.",
+    )
+    parser.add_argument(
+        "--inspection-region-height-m",
+        type=float,
+        default=INSPECTION_REGION_HEIGHT_M,
+        help="Physical height of the inspection target region used for visual footprint scoring.",
+    )
+    parser.add_argument(
+        "--inspection-good-footprint-px",
+        type=float,
+        default=INSPECTION_GOOD_FOOTPRINT_PX,
+        help="Projected target width/height in pixels that counts as a full apparent-size score.",
+    )
+    parser.add_argument(
+        "--inspection-frame-margin-fraction",
+        type=float,
+        default=INSPECTION_FRAME_COMFORT_MARGIN_FRACTION,
+        help="Fraction of the smaller image dimension used as the comfortable in-frame margin.",
+    )
+    parser.add_argument(
+        "--inspection-sharpness-min-variance",
+        type=float,
+        default=INSPECTION_SHARPNESS_MIN_VARIANCE,
+        help="Laplacian variance that maps to sharpness score 0.",
+    )
+    parser.add_argument(
+        "--inspection-sharpness-good-variance",
+        type=float,
+        default=INSPECTION_SHARPNESS_GOOD_VARIANCE,
+        help="Laplacian variance that maps to sharpness score 1.",
     )
     parser.add_argument(
         "--wind",
