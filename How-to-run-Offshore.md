@@ -47,3 +47,9 @@ use `--wind` to simulate real wind from WRF data.
 ```python
 python offshore_demo.py --mode-flight manual-direct --route-speed-mps 4 --gimbal --camera-width 1280 --camera-height 720 --preview-width 1280 --preview-height 720 --wind --battery-start-percent 100
 ```
+
+Use for px4 manual controls
+```python
+python offshore_demo.py --mode-flight manual-px4 --route-speed-mps 4 --gimbal --camera-width 1280 --camera-height 720 --preview-width 1280 --preview-height 720 --battery-start-percent 100 --video --manual-speed-step-mps 1 --manual-acceleration-limit-mps2 0.8 --manual-yaw-acceleration-dps2 50
+```
+Use `--artificial-wind` to simulate it.

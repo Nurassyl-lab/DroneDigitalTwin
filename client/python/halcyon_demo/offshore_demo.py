@@ -13,6 +13,8 @@ Controls:
   up/down  manual altitude up/down in manual-direct or manual-px4
   left/right  manual yaw left/right in manual-direct or manual-px4
   k/l  increase/decrease manual speed
+  1/2/3  artificial wind off/15 m/s/30 m/s when --artificial-wind is enabled
+  h  toggle PX4 position hold
   e  teleport to next route point
   r  teleport to previous route point
   t  enter custom teleport as x,y,z,angle
@@ -158,6 +160,11 @@ INSPECTION_FRAME_COMFORT_MARGIN_FRACTION = 0.12
 INSPECTION_SHARPNESS_MIN_VARIANCE = 40.0
 INSPECTION_SHARPNESS_GOOD_VARIANCE = 180.0
 INSPECTION_VISUAL_DEBUG_INTERVAL_SEC = 1.0
+ARTIFICIAL_WIND_DEFAULT_BASE_DIRECTION_DEG = 195.0
+ARTIFICIAL_WIND_DEFAULT_UPDATE_HZ = 8.0
+HOLD_DEFAULT_UPDATE_HZ = 5.0
+HOLD_DEFAULT_SPEED_MPS = 2.0
+HOLD_STABILITY_ERROR_BAD_M = 2.0
 WARNED_UNAVAILABLE = set()
 
 
@@ -166,6 +173,22 @@ class RoutePoint:
     label: str
     position: List[float]
     yaw_deg: float
+
+
+@dataclass(frozen=True)
+class ArtificialWindMode:
+    nominal_speed_mps: float
+    direction_amplitude_deg: float
+    direction_frequency_hz: float
+    speed_modulation_fraction: float
+    speed_frequency_hz: float
+
+
+ARTIFICIAL_WIND_MODES = {
+    0: ArtificialWindMode(0.0, 0.0, 0.0, 0.0, 0.0),
+    2: ArtificialWindMode(15.0, 20.0, 0.35, 0.10, 0.23),
+    3: ArtificialWindMode(30.0, 40.0, 0.60, 0.18, 0.41),
+}
 
 
 def route_to_ned(position: Sequence[float]) -> List[float]:
@@ -671,6 +694,18 @@ class DemoState:
         self.wind_enabled = False
         self.wind_sample = None
         self.wind_status = ""
+        self.artificial_wind_enabled = False
+        self.artificial_wind_level = 0
+        self.artificial_wind_speed_mps = 0.0
+        self.artificial_wind_direction_to_deg = ARTIFICIAL_WIND_DEFAULT_BASE_DIRECTION_DEG
+        self.artificial_wind_requests = queue.SimpleQueue()
+        self.artificial_wind_last_request_at = 0.0
+        self.hold_active = False
+        self.hold_position = None
+        self.hold_yaw_deg = None
+        self.hold_error_m = 0.0
+        self.hold_toggle_requests = queue.SimpleQueue()
+        self.hold_last_toggle_request_at = 0.0
         self.teleport_requests = queue.SimpleQueue()
         self.manual_teleport_requests = queue.SimpleQueue()
         self.stop_requested = False
@@ -714,6 +749,16 @@ class DemoState:
                 "wind_enabled": self.wind_enabled,
                 "wind_sample": self.wind_sample,
                 "wind_status": self.wind_status,
+                "artificial_wind_enabled": self.artificial_wind_enabled,
+                "artificial_wind_level": self.artificial_wind_level,
+                "artificial_wind_speed_mps": self.artificial_wind_speed_mps,
+                "artificial_wind_direction_to_deg": self.artificial_wind_direction_to_deg,
+                "hold_active": self.hold_active,
+                "hold_position": (
+                    list(self.hold_position) if self.hold_position is not None else None
+                ),
+                "hold_yaw_deg": self.hold_yaw_deg,
+                "hold_error_m": self.hold_error_m,
                 "stop_requested": self.stop_requested,
             }
 
@@ -815,6 +860,66 @@ class DemoState:
             self.wind_enabled = True
             self.wind_sample = sample
             self.wind_status = status
+
+    def set_artificial_wind_enabled(self, enabled: bool):
+        with self.lock:
+            self.artificial_wind_enabled = bool(enabled)
+            if not enabled:
+                self.artificial_wind_level = 0
+                self.artificial_wind_speed_mps = 0.0
+
+    def queue_artificial_wind_level(self, level: int):
+        if level not in ARTIFICIAL_WIND_MODES:
+            return
+        now = time.monotonic()
+        if now - self.artificial_wind_last_request_at < 0.25:
+            return
+        self.artificial_wind_last_request_at = now
+        self.artificial_wind_requests.put(level)
+
+    def update_artificial_wind(
+        self,
+        level: int,
+        speed_mps: float,
+        direction_to_deg: float,
+    ):
+        with self.lock:
+            self.artificial_wind_enabled = True
+            self.artificial_wind_level = int(level)
+            self.artificial_wind_speed_mps = max(0.0, float(speed_mps))
+            self.artificial_wind_direction_to_deg = float(direction_to_deg) % 360.0
+
+    def queue_hold_toggle(self):
+        now = time.monotonic()
+        if now - self.hold_last_toggle_request_at < 0.25:
+            return
+        self.hold_last_toggle_request_at = now
+        self.hold_toggle_requests.put(True)
+
+    def set_hold(
+        self,
+        active: bool,
+        position: Optional[Sequence[float]] = None,
+        yaw_deg: Optional[float] = None,
+    ):
+        with self.lock:
+            self.hold_active = bool(active)
+            if active and position is not None:
+                self.hold_position = [
+                    float(position[0]),
+                    float(position[1]),
+                    float(position[2]),
+                ]
+                self.hold_yaw_deg = float(yaw_deg) % 360.0 if yaw_deg is not None else None
+                self.hold_error_m = 0.0
+            elif not active:
+                self.hold_position = None
+                self.hold_yaw_deg = None
+                self.hold_error_m = 0.0
+
+    def update_hold_error(self, error_m: float):
+        with self.lock:
+            self.hold_error_m = max(0.0, float(error_m))
 
     def update_image_diagnostic(self, name: str, image):
         position = image_pose_position(image)
@@ -925,6 +1030,7 @@ class OffshorePreview:
         inspection_sharpness_good_variance: float = INSPECTION_SHARPNESS_GOOD_VARIANCE,
         inspection_weights: Sequence[float] = INSPECTION_DEFAULT_WEIGHTS,
         inspection_pass_threshold: float = INSPECTION_DEFAULT_PASS_THRESHOLD,
+        hold_stability_error_bad_m: float = HOLD_STABILITY_ERROR_BAD_M,
     ):
         self.state = state
         self.route_overlay = list(route_overlay) if route_overlay is not None else list(state.route)
@@ -954,6 +1060,7 @@ class OffshorePreview:
         )
         self.inspection_weights = tuple(float(weight) for weight in inspection_weights)
         self.inspection_pass_threshold = clamp(float(inspection_pass_threshold), 0.0, 1.0)
+        self.hold_stability_error_bad_m = max(0.1, float(hold_stability_error_bad_m))
         self.inspection_centroid_history = []
         self.last_visual_debug_at = 0.0
         self.record_video = bool(record_video)
@@ -1231,6 +1338,18 @@ class OffshorePreview:
         elif key in (ord("t"), ord("T")):
             if self.accept_key("t"):
                 self.state.queue_manual_teleport()
+        elif key == ord("1"):
+            if self.accept_key("1"):
+                self.state.queue_artificial_wind_level(0)
+        elif key == ord("2"):
+            if self.accept_key("2"):
+                self.state.queue_artificial_wind_level(2)
+        elif key == ord("3"):
+            if self.accept_key("3"):
+                self.state.queue_artificial_wind_level(3)
+        elif key in (ord("h"), ord("H")):
+            if self.accept_key("h"):
+                self.state.queue_hold_toggle()
         elif key in (ord("q"), 27):
             self.state.request_stop()
             self.running = False
@@ -1360,9 +1479,26 @@ class OffshorePreview:
                     f"{wind_sample.direction_to_deg:.0f} deg  "
                     f"VERT {wind_sample.w_up_mps:+.2f} m/s"
                 )
+        if snapshot["artificial_wind_enabled"]:
+            lines.append("ARTIFICIAL WIND STRESS TEST")
+            if snapshot["artificial_wind_level"] == 0:
+                lines.append("ART WIND: OFF")
+            else:
+                lines.append(
+                    f"ART WIND: {snapshot['artificial_wind_speed_mps']:.1f} m/s @ "
+                    f"{snapshot['artificial_wind_direction_to_deg']:.1f} deg"
+                )
+        if snapshot["artificial_wind_enabled"] or snapshot["hold_active"]:
+            if snapshot["hold_active"]:
+                lines.append("HOLD: ON")
+                lines.append(f"HOLD ERR: {snapshot['hold_error_m']:.2f} m")
+            else:
+                lines.append("HOLD: OFF")
         control_hint = "e/r teleport | t custom | q/esc quit"
         if str(snapshot["mode"]).startswith("manual "):
             control_hint = "WASD/arrows fly | K/L speed | e/r/t teleport | q/esc quit"
+            if snapshot["artificial_wind_enabled"]:
+                control_hint = "WASD/arrows | K/L speed | 1/2/3 wind | H hold | q/esc"
         lines.extend([snapshot["mode_detail"], control_hint])
         height, width = frame.shape[:2]
         text_scale = 0.38 if width <= 800 or height <= 650 else 0.44
@@ -1370,22 +1506,48 @@ class OffshorePreview:
         y = height - (line_spacing * len(lines) + 8)
         for line in lines:
             is_wind_line = line.startswith("WIND ")
+            is_artificial_wind_line = (
+                line.startswith("ART WIND:")
+                and snapshot.get("artificial_wind_level", 0) != 0
+            )
             if is_wind_line and snapshot.get("wind_sample") is not None:
                 arrow_radius = 12 if text_scale <= 0.38 else 14
-                self.draw_wind_arrow(cv2, frame, snapshot, (36, y - 6), arrow_radius)
+                self.draw_wind_arrow(
+                    cv2,
+                    frame,
+                    snapshot["wind_sample"].direction_to_deg,
+                    snapshot["heading_deg"],
+                    (36, y - 6),
+                    arrow_radius,
+                )
+                text_x = 56 if text_scale <= 0.38 else 64
+            elif is_artificial_wind_line:
+                arrow_radius = 12 if text_scale <= 0.38 else 14
+                self.draw_wind_arrow(
+                    cv2,
+                    frame,
+                    snapshot["artificial_wind_direction_to_deg"],
+                    snapshot["heading_deg"],
+                    (36, y - 6),
+                    arrow_radius,
+                )
                 text_x = 56 if text_scale <= 0.38 else 64
             else:
                 text_x = 18
             self.draw_text(cv2, frame, line, (text_x, y), scale=text_scale)
             y += line_spacing
 
-    def draw_wind_arrow(self, cv2, frame, snapshot: Dict, center: Tuple[int, int], radius: int):
-        wind_sample = snapshot["wind_sample"]
-        if wind_sample is None or wind_sample.horizontal_speed_mps <= 1e-6:
-            return
-
+    def draw_wind_arrow(
+        self,
+        cv2,
+        frame,
+        direction_to_deg: float,
+        heading_deg: float,
+        center: Tuple[int, int],
+        radius: int,
+    ):
         # Arrow is relative to the drone/camera: up=forward, right=drone right.
-        relative_deg = (wind_sample.direction_to_deg - snapshot["heading_deg"]) % 360.0
+        relative_deg = (float(direction_to_deg) - float(heading_deg)) % 360.0
         relative_rad = math.radians(relative_deg)
         dx = math.sin(relative_rad)
         dy = -math.cos(relative_rad)
@@ -1634,6 +1796,22 @@ class OffshorePreview:
                 score_camera_resolution,
             )
             stability_score = self.update_inspection_stability(visual["centroid"])
+            if snapshot.get("hold_active"):
+                hold_error_score = clamp(
+                    1.0
+                    - float(snapshot.get("hold_error_m", 0.0))
+                    / self.hold_stability_error_bad_m,
+                    0.0,
+                    1.0,
+                )
+                if stability_score is None:
+                    stability_score = hold_error_score
+                else:
+                    stability_score = clamp(
+                        0.65 * stability_score + 0.35 * hold_error_score,
+                        0.0,
+                        1.0,
+                    )
             stability_for_confidence = 0.5 if stability_score is None else stability_score
             visual_score = float(visual["score"])
         else:
@@ -2094,6 +2272,8 @@ def ensure_px4_route_speed_params(robot_config: Dict, args):
             "MPC_Z_VEL_MAX_DN": vertical_speed_mps,
         }
     )
+    if manual_px4_mode:
+        parameters["MPC_ACC_HOR"] = max(0.1, float(args.manual_acceleration_limit_mps2))
     projectairsim_log().info(
         "Runtime config set PX4 route speed params: xy=%.1f m/s vertical-down=%.1f m/s",
         xy_speed_mps,
@@ -2597,6 +2777,30 @@ def drain_teleport_request(state: DemoState) -> Optional[int]:
     return delta
 
 
+def drain_artificial_wind_request(state: DemoState) -> Optional[int]:
+    level = None
+    while not state.artificial_wind_requests.empty():
+        level = state.artificial_wind_requests.get()
+    return level
+
+
+def drain_hold_toggle_request(state: DemoState) -> bool:
+    requested = False
+    while not state.hold_toggle_requests.empty():
+        state.hold_toggle_requests.get()
+        requested = True
+    return requested
+
+
+def queue_manual_special_keys(keyboard_module, state: DemoState):
+    for key_name, level in (("1", 0), ("2", 2), ("3", 3)):
+        if keyboard_module.is_pressed(key_name):
+            state.queue_artificial_wind_level(level)
+            break
+    if keyboard_module.is_pressed("h"):
+        state.queue_hold_toggle()
+
+
 def nearest_route_index(route: Sequence[RoutePoint], position: Sequence[float]) -> int:
     best_index = 0
     best_distance = float("inf")
@@ -3008,6 +3212,112 @@ async def run_wrf_wind_updater(
         state.request_stop()
 
 
+def wind_direction_to_ned_components(
+    speed_mps: float,
+    direction_to_deg: float,
+) -> Tuple[float, float, float]:
+    direction_rad = math.radians(float(direction_to_deg))
+    return (
+        float(speed_mps) * math.cos(direction_rad),
+        float(speed_mps) * math.sin(direction_rad),
+        0.0,
+    )
+
+
+async def run_artificial_wind_updater(
+    world: World,
+    state: DemoState,
+    args,
+):
+    update_interval_sec = 1.0 / max(0.1, float(args.artificial_wind_update_hz))
+    base_direction_deg = float(args.artificial_wind_base_direction_deg) % 360.0
+    level = 0
+    state.set_artificial_wind_enabled(True)
+    state.update_artificial_wind(level, 0.0, base_direction_deg)
+    projectairsim_log().info(
+        "ARTIFICIAL WIND STRESS TEST enabled. Press 1=off, 2=15 m/s, 3=30 m/s."
+    )
+
+    try:
+        world.set_wind_velocity(0.0, 0.0, 0.0)
+        while not state.snapshot()["stop_requested"]:
+            requested_level = drain_artificial_wind_request(state)
+            if requested_level is not None:
+                level = requested_level
+                if level == 0:
+                    projectairsim_log().info("ARTIFICIAL WIND STRESS TEST: OFF")
+                else:
+                    projectairsim_log().info(
+                        "ARTIFICIAL WIND STRESS TEST: mode %d nominal %.1f m/s",
+                        level,
+                        ARTIFICIAL_WIND_MODES[level].nominal_speed_mps,
+                    )
+
+            mode = ARTIFICIAL_WIND_MODES[level]
+            sim_time_sec = float(world.get_sim_time()) * 1e-9
+            if level == 0:
+                speed_mps = 0.0
+                direction_to_deg = base_direction_deg
+            else:
+                direction_to_deg = (
+                    base_direction_deg
+                    + mode.direction_amplitude_deg
+                    * math.sin(2.0 * math.pi * mode.direction_frequency_hz * sim_time_sec)
+                ) % 360.0
+                speed_mps = mode.nominal_speed_mps * (
+                    1.0
+                    + mode.speed_modulation_fraction
+                    * math.sin(2.0 * math.pi * mode.speed_frequency_hz * sim_time_sec)
+                )
+                speed_mps = max(0.0, speed_mps)
+
+            north, east, down = wind_direction_to_ned_components(
+                speed_mps,
+                direction_to_deg,
+            )
+            world.set_wind_velocity(north, east, down)
+            state.update_artificial_wind(level, speed_mps, direction_to_deg)
+            await asyncio.sleep(update_interval_sec)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        projectairsim_log().warning("Artificial wind updater failed: %s", exc)
+        projectairsim_log().warning(
+            "Artificial wind updater traceback:\n%s",
+            traceback.format_exc(),
+        )
+        state.set_artificial_wind_enabled(False)
+        state.request_stop()
+    finally:
+        with suppress(Exception):
+            world.set_wind_velocity(0.0, 0.0, 0.0)
+
+
+async def send_hold_position_command(
+    drone: Drone,
+    state: DemoState,
+    args,
+    hold_position: Sequence[float],
+    hold_yaw_deg: Optional[float],
+) -> bool:
+    try:
+        await drone.move_to_position_async(
+            north=float(hold_position[0]),
+            east=float(hold_position[1]),
+            down=float(hold_position[2]),
+            velocity=max(0.1, float(args.hold_speed_mps)),
+            timeout_sec=max(1.0, 2.0 / max(0.1, float(args.hold_update_hz))),
+            yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
+            yaw_is_rate=hold_yaw_deg is None,
+            yaw=0.0 if hold_yaw_deg is None else math.radians(float(hold_yaw_deg)),
+        )
+        return True
+    except Exception as exc:
+        projectairsim_log().warning("HOLD position command failed: %s", exc)
+        state.set_hold(False)
+        return False
+
+
 def drain_manual_teleport_request(state: DemoState) -> bool:
     requested = False
     while not state.manual_teleport_requests.empty():
@@ -3048,6 +3358,7 @@ async def apply_teleport(
 ):
     point = state.route[index]
     cancel_last_task_safely(drone)
+    state.set_hold(False)
     target_ned = route_to_ned(point.position)
     state.update_requested(point.label, target_ned, point.yaw_deg)
     state.bump_camera_epoch()
@@ -3106,6 +3417,7 @@ async def prompt_manual_teleport(
 
     target_ned = route_to_ned(point.position)
     cancel_last_task_safely(drone)
+    state.set_hold(False)
     state.update_requested(point.label, target_ned, point.yaw_deg)
     state.bump_camera_epoch()
     pose = make_pose_ned_yaw(target_ned, point.yaw_deg)
@@ -3719,6 +4031,8 @@ def print_manual_controls(
     print("Up/Down Arrows: up/down altitude")
     print("Left/Right Arrows: yaw left/right")
     print("K/L: increase/decrease speed")
+    print("1/2/3: artificial wind off/15 m/s/30 m/s when --artificial-wind is enabled")
+    print("H: toggle PX4 position hold")
     print("E/R/T: route/custom teleport in the preview window")
     print("Q/Esc: exit")
     print("Manual PX4 runs PX4 takeoff by default; use --no-manual-px4-takeoff to skip")
@@ -3765,6 +4079,8 @@ async def run_manual_direct_flight(
             state.request_stop()
             break
 
+        queue_manual_special_keys(keyboard_module, state)
+
         if keyboard_module.is_pressed("k") and (
             now - last_speed_adjust_at >= speed_adjust_debounce_sec
         ):
@@ -3783,26 +4099,29 @@ async def run_manual_direct_flight(
         current_ned = get_pose_position_ned(drone)
         yaw_rad = get_pose_yaw_ned(drone)
         target_yaw_rad = yaw_rad
-        if keyboard_module.is_pressed("left"):
-            target_yaw_rad -= math.radians(yaw_rate_dps) * dt
-        elif keyboard_module.is_pressed("right"):
-            target_yaw_rad += math.radians(yaw_rate_dps) * dt
+        hold_active = state.snapshot()["hold_active"]
+        if not hold_active:
+            if keyboard_module.is_pressed("left"):
+                target_yaw_rad -= math.radians(yaw_rate_dps) * dt
+            elif keyboard_module.is_pressed("right"):
+                target_yaw_rad += math.radians(yaw_rate_dps) * dt
 
         body_velocity = [0.0, 0.0, 0.0]
-        if keyboard_module.is_pressed("w"):
-            body_velocity[0] = current_speed_mps
-        elif keyboard_module.is_pressed("s"):
-            body_velocity[0] = -current_speed_mps
+        if not hold_active:
+            if keyboard_module.is_pressed("w"):
+                body_velocity[0] = current_speed_mps
+            elif keyboard_module.is_pressed("s"):
+                body_velocity[0] = -current_speed_mps
 
-        if keyboard_module.is_pressed("a"):
-            body_velocity[1] = -current_speed_mps
-        elif keyboard_module.is_pressed("d"):
-            body_velocity[1] = current_speed_mps
+            if keyboard_module.is_pressed("a"):
+                body_velocity[1] = -current_speed_mps
+            elif keyboard_module.is_pressed("d"):
+                body_velocity[1] = current_speed_mps
 
-        if keyboard_module.is_pressed("up"):
-            body_velocity[2] = -current_speed_mps
-        elif keyboard_module.is_pressed("down"):
-            body_velocity[2] = current_speed_mps
+            if keyboard_module.is_pressed("up"):
+                body_velocity[2] = -current_speed_mps
+            elif keyboard_module.is_pressed("down"):
+                body_velocity[2] = current_speed_mps
 
         world_velocity = [
             body_velocity[0] * math.cos(target_yaw_rad)
@@ -3849,16 +4168,14 @@ async def run_manual_px4_flight(
     speed_step_mps = max(0.1, float(args.manual_speed_step_mps))
     min_speed_mps = max(0.0, float(args.manual_min_speed_mps))
     command_duration_sec = max(0.05, float(args.manual_command_duration_sec))
-    max_velocity_delta = (
-        max(0.0, float(args.manual_acceleration_limit_mps2)) * command_duration_sec
-    )
-    max_yaw_delta = (
-        max(0.0, float(args.manual_yaw_acceleration_dps2)) * command_duration_sec
-    )
+    acceleration_limit_mps2 = max(0.0, float(args.manual_acceleration_limit_mps2))
+    yaw_acceleration_dps2 = max(0.0, float(args.manual_yaw_acceleration_dps2))
+    brake_velocity_delta = acceleration_limit_mps2 * command_duration_sec
     yaw_rate_dps = max(0.0, float(args.manual_px4_yaw_rate_dps))
     speed_adjust_debounce_sec = 0.25
     last_speed_adjust_at = 0.0
     last_report_at = 0.0
+    last_tick_at = time.time()
     last_camera_epoch = state.snapshot()["camera_epoch"]
     commanded_velocity = [0.0, 0.0, 0.0]
     commanded_yaw_rate_dps = 0.0
@@ -3894,9 +4211,16 @@ async def run_manual_px4_flight(
         projectairsim_log().info(
             "Manual PX4 flight active: WASD/arrows fly, K/L speed, q/esc quit"
         )
+        projectairsim_log().info(
+            "Manual PX4 smoothing: acceleration %.2f m/s^2, yaw acceleration %.1f deg/s^2",
+            acceleration_limit_mps2,
+            yaw_acceleration_dps2,
+        )
 
         while not state.snapshot()["stop_requested"]:
             now = time.time()
+            dt = min(max(now - last_tick_at, 0.0), command_duration_sec)
+            last_tick_at = now
             snapshot = state.snapshot()
             if snapshot["camera_epoch"] != last_camera_epoch:
                 commanded_velocity = [0.0, 0.0, 0.0]
@@ -3912,6 +4236,8 @@ async def run_manual_px4_flight(
                 projectairsim_log().info("Manual PX4 flight requested exit")
                 state.request_stop()
                 break
+
+            queue_manual_special_keys(keyboard_module, state)
 
             if keyboard_module.is_pressed("k") and (
                 now - last_speed_adjust_at >= speed_adjust_debounce_sec
@@ -3930,35 +4256,40 @@ async def run_manual_px4_flight(
 
             target_velocity = [0.0, 0.0, 0.0]
             target_yaw_rate_dps = 0.0
-            if keyboard_module.is_pressed("w"):
-                target_velocity[0] = current_speed_mps
-            elif keyboard_module.is_pressed("s"):
-                target_velocity[0] = -current_speed_mps
+            hold_active = state.snapshot()["hold_active"]
+            if hold_active:
+                commanded_velocity = [0.0, 0.0, 0.0]
+                commanded_yaw_rate_dps = 0.0
+            else:
+                if keyboard_module.is_pressed("w"):
+                    target_velocity[0] = current_speed_mps
+                elif keyboard_module.is_pressed("s"):
+                    target_velocity[0] = -current_speed_mps
 
-            if keyboard_module.is_pressed("a"):
-                target_velocity[1] = -current_speed_mps
-            elif keyboard_module.is_pressed("d"):
-                target_velocity[1] = current_speed_mps
+                if keyboard_module.is_pressed("a"):
+                    target_velocity[1] = -current_speed_mps
+                elif keyboard_module.is_pressed("d"):
+                    target_velocity[1] = current_speed_mps
 
-            if keyboard_module.is_pressed("up"):
-                target_velocity[2] = -current_speed_mps
-            elif keyboard_module.is_pressed("down"):
-                target_velocity[2] = current_speed_mps
+                if keyboard_module.is_pressed("up"):
+                    target_velocity[2] = -current_speed_mps
+                elif keyboard_module.is_pressed("down"):
+                    target_velocity[2] = current_speed_mps
 
-            if keyboard_module.is_pressed("left"):
-                target_yaw_rate_dps = -yaw_rate_dps
-            elif keyboard_module.is_pressed("right"):
-                target_yaw_rate_dps = yaw_rate_dps
+                if keyboard_module.is_pressed("left"):
+                    target_yaw_rate_dps = -yaw_rate_dps
+                elif keyboard_module.is_pressed("right"):
+                    target_yaw_rate_dps = yaw_rate_dps
 
             commanded_velocity = limit_vector_delta(
                 commanded_velocity,
                 target_velocity,
-                max_velocity_delta,
+                acceleration_limit_mps2 * dt,
             )
             commanded_yaw_rate_dps = move_scalar_toward(
                 commanded_yaw_rate_dps,
                 target_yaw_rate_dps,
-                max_yaw_delta,
+                yaw_acceleration_dps2 * dt,
             )
 
             should_send = (
@@ -4004,7 +4335,7 @@ async def run_manual_px4_flight(
                     drone,
                     commanded_velocity,
                     command_duration_sec,
-                    max_velocity_delta,
+                    brake_velocity_delta,
                 )
             if not args.manual_keep_armed:
                 safe_call("Manual PX4 disarm", drone.disarm)
@@ -4029,6 +4360,7 @@ async def run_teleport_viewer(
     last_report_at = 0.0
     last_diagnostics_at = 0.0
     last_inspection_at = 0.0
+    last_hold_command_at = 0.0
     auto_flight_task = (
         asyncio.create_task(run_route_auto_flight(drone, state, args, world))
         if start_auto_flight
@@ -4050,6 +4382,32 @@ async def run_teleport_viewer(
             current = ned_to_route(current_ned)
             current_heading = heading_deg_360(get_pose_yaw_ned(drone))
             state.update_pose(current, current_heading)
+            now = time.time()
+
+            if drain_hold_toggle_request(state):
+                snapshot = state.snapshot()
+                if snapshot["auto_flight_running"]:
+                    projectairsim_log().info("Ignoring HOLD key while auto flight is running")
+                elif manual_flight_mode != "px4":
+                    projectairsim_log().warning(
+                        "HOLD uses PX4 position control. Use --mode-flight manual-px4 "
+                        "for the artificial-wind stress-test demo."
+                    )
+                elif snapshot["hold_active"]:
+                    cancel_last_task_safely(drone)
+                    state.set_hold(False)
+                    projectairsim_log().info("HOLD OFF")
+                    last_hold_command_at = 0.0
+                else:
+                    cancel_last_task_safely(drone)
+                    state.set_hold(True, current, current_heading)
+                    projectairsim_log().info(
+                        "HOLD ON NED %s heading %.1f deg",
+                        format_vector3(current),
+                        current_heading,
+                    )
+                    last_hold_command_at = 0.0
+
             if state.check_battery_depleted() or state.snapshot()["coverage_unfeasible"]:
                 log_coverage_unfeasible_if_needed(state)
                 if not state.snapshot()["auto_flight_running"]:
@@ -4058,7 +4416,22 @@ async def run_teleport_viewer(
             if not state.snapshot()["auto_flight_running"]:
                 state.set_route_index(nearest_route_index(state.route, current))
 
-            now = time.time()
+            snapshot = state.snapshot()
+            hold_position = snapshot.get("hold_position")
+            if snapshot["hold_active"] and hold_position is not None:
+                hold_error_m = distance_between(current, hold_position)
+                state.update_hold_error(hold_error_m)
+                if now - last_hold_command_at >= 1.0 / max(0.1, float(args.hold_update_hz)):
+                    hold_command_sent = await send_hold_position_command(
+                        drone,
+                        state,
+                        args,
+                        hold_position,
+                        snapshot.get("hold_yaw_deg"),
+                    )
+                    if hold_command_sent:
+                        last_hold_command_at = now
+
             if now - last_inspection_at >= 1.0 / max(0.1, float(args.inspection_update_hz)):
                 snapshot = state.snapshot()
                 camera_position = snapshot.get("fpv_camera_position") or current_ned
@@ -4149,6 +4522,11 @@ async def run_demo(args):
             "direct": "manual-direct",
             "px4": "manual-px4",
         }.get(mode_flight, mode_flight)
+        if args.artificial_wind and mode_flight == "manual-direct":
+            projectairsim_log().warning(
+                "--mode-flight manual-direct uses SetPose and bypasses PX4 wind physics. "
+                "Use --mode-flight manual-px4 for the artificial-wind stress-test demo."
+            )
         temp_config_dir, scene_name, sim_config_path = make_runtime_scene_config(args, route)
 
         projectairsim_log().info("Connecting to Project AirSim")
@@ -4191,7 +4569,16 @@ async def run_demo(args):
             )
 
         state = DemoState(route, battery_start_percent=args.battery_start_percent)
-        if args.wind:
+        if args.artificial_wind:
+            if args.wind:
+                projectairsim_log().warning(
+                    "--artificial-wind replaces --wind for this run; WRF wind is not started."
+                )
+            state.set_artificial_wind_enabled(True)
+            wind_task = asyncio.create_task(
+                run_artificial_wind_updater(world, state, args)
+            )
+        elif args.wind:
             state.set_wind_enabled(True, "initializing")
             wind_field = create_wrf_wind_field(world, args)
             wind_task = asyncio.create_task(
@@ -4219,6 +4606,7 @@ async def run_demo(args):
             inspection_sharpness_good_variance=args.inspection_sharpness_good_variance,
             inspection_weights=args.inspection_confidence_weights,
             inspection_pass_threshold=args.inspection_pass_threshold,
+            hold_stability_error_bad_m=args.hold_stability_error_bad_m,
         )
         preview.start()
         client.subscribe(fpv_topic, preview.receive_fpv)
@@ -4289,7 +4677,7 @@ async def run_demo(args):
             wind_task.cancel()
             with suppress(asyncio.CancelledError):
                 await wind_task
-        if args.wind and world is not None:
+        if (args.wind or args.artificial_wind) and world is not None:
             try:
                 world.set_wind_velocity(0.0, 0.0, 0.0)
             except Exception:
@@ -4544,14 +4932,14 @@ def build_parser():
     parser.add_argument(
         "--manual-acceleration-limit-mps2",
         type=float,
-        default=6.0,
-        help="Manual PX4 velocity change rate. Matches px4_astar keyboard smoothing by default.",
+        default=1.5,
+        help="Manual PX4 velocity change rate. Lower values reduce visible tilt on W/A/S/D.",
     )
     parser.add_argument(
         "--manual-yaw-acceleration-dps2",
         type=float,
-        default=120.0,
-        help="Manual PX4 yaw-rate change rate. Matches px4_astar keyboard smoothing by default.",
+        default=80.0,
+        help="Manual PX4 yaw-rate change rate.",
     )
     parser.add_argument(
         "--manual-px4-takeoff",
@@ -4857,6 +5245,44 @@ def build_parser():
         "--wind",
         action="store_true",
         help="Enable spatially varying WRF wind and show wind telemetry in the FPV overlay.",
+    )
+    parser.add_argument(
+        "--artificial-wind",
+        action="store_true",
+        help=(
+            "Enable deterministic artificial wind stress-test mode. "
+            "Keys: 1=off, 2=15 m/s gusty, 3=30 m/s severe."
+        ),
+    )
+    parser.add_argument(
+        "--artificial-wind-base-direction-deg",
+        type=float,
+        default=ARTIFICIAL_WIND_DEFAULT_BASE_DIRECTION_DEG,
+        help="Artificial wind direction-TO base angle in NED degrees.",
+    )
+    parser.add_argument(
+        "--artificial-wind-update-hz",
+        type=float,
+        default=ARTIFICIAL_WIND_DEFAULT_UPDATE_HZ,
+        help="How often to update deterministic artificial wind.",
+    )
+    parser.add_argument(
+        "--hold-update-hz",
+        type=float,
+        default=HOLD_DEFAULT_UPDATE_HZ,
+        help="How often to refresh the PX4 position-hold command after pressing H.",
+    )
+    parser.add_argument(
+        "--hold-speed-mps",
+        type=float,
+        default=HOLD_DEFAULT_SPEED_MPS,
+        help="PX4 move-to-position speed used while H position hold is active.",
+    )
+    parser.add_argument(
+        "--hold-stability-error-bad-m",
+        type=float,
+        default=HOLD_STABILITY_ERROR_BAD_M,
+        help="HOLD ERR that maps to zero extra hold stability contribution.",
     )
     parser.add_argument(
         "--wrf-file",
