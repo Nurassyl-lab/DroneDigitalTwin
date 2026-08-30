@@ -3721,6 +3721,7 @@ def print_manual_controls(
     print("K/L: increase/decrease speed")
     print("E/R/T: route/custom teleport in the preview window")
     print("Q/Esc: exit")
+    print("Manual PX4 runs PX4 takeoff by default; use --no-manual-px4-takeoff to skip")
     print(f"Speed: {current_speed_mps:.1f} m/s")
     print(f"Speed step: {speed_step_mps:.1f} m/s")
     print("Speed cap: unbounded")
@@ -3872,6 +3873,7 @@ async def run_manual_px4_flight(
         await arm_with_retry(drone, args.arm_timeout_sec)
 
         if args.manual_px4_takeoff:
+            state.set_mode("manual px4", "taking off")
             projectairsim_log().info("Manual PX4 takeoff requested")
             takeoff_task = await drone.takeoff_async(timeout_sec=args.takeoff_timeout_sec)
             await await_drone_task(
@@ -3880,6 +3882,10 @@ async def run_manual_px4_flight(
                 "Manual PX4 takeoff",
                 args.takeoff_timeout_sec + 5.0,
                 args.pose_report_interval_sec,
+            )
+        else:
+            projectairsim_log().info(
+                "Manual PX4 takeoff skipped; velocity commands may not move a landed PX4 vehicle"
             )
 
         await request_px4_control(drone)
@@ -4543,8 +4549,16 @@ def build_parser():
     )
     parser.add_argument(
         "--manual-px4-takeoff",
+        dest="manual_px4_takeoff",
         action="store_true",
+        default=True,
         help="Run a PX4 takeoff before manual PX4 control.",
+    )
+    parser.add_argument(
+        "--no-manual-px4-takeoff",
+        dest="manual_px4_takeoff",
+        action="store_false",
+        help="Skip PX4 takeoff before manual PX4 control.",
     )
     parser.add_argument(
         "--manual-keep-armed",
