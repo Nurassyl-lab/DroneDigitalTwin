@@ -89,21 +89,23 @@ from wrf_wind import WRFWindField, WRFWindSample  # noqa: E402
 #     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
 #     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
 # ]
-# OFFSHORE_ROUTE = [
-#     ("Origin", [0.0, 148.0, -2.0], 270.0),
-#     ("Around waypoint 1", [12.85,-11.4,-115], 127.6),
-#     ("Waypoint 1", [1.28, -14.66, -115.16], 127.6),
-#     ("Around waypoint 2", [881.6,17,-113], 324.3),
-#     ("Waypoint 2", [893.69, 7.89, -112.77], 324.3),
-#     ("Around waypoint 3", [895,-870,-20], 279.5),
-#     ("Waypoint 3", [899.44, -892.28, -12.28], 279.5),
-#     ("Around waypoint 4", [21,-908,-111], 55.2),
-#     ("Waypoint 4", [6.35, -910.1, -117.81], 55.2),
-#     ("Around waypoint 5", [-870, -901.37, -20], 159.9),
-#     ("Waypoint 5", [-894.61, -901.37, -114.0], 159.9),
-#     ("Around waypoint 6", [-890, -11, -12.82], 111.0),
-#     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
-#     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
+OFFSHORE_ROUTE = [
+    ("Origin", [0.0, 148.0, -2.0], 270.0),
+    ("Around waypoint 1", [12.85,-11.4,-115], 127.6),
+    ("Waypoint 1", [1.28, -14.66, -115.16], 127.6),
+    ("Around waypoint 2", [881.6,17,-113], 324.3),
+    ("Waypoint 2", [893.69, 7.89, -112.77], 324.3),
+    ("Around waypoint 3", [895,-870,-20], 279.5),
+    ("Waypoint 3", [899.44, -892.28, -12.28], 279.5),
+    ("Around waypoint 4", [21,-908,-111], 55.2),
+    ("Waypoint 4", [6.35, -910.1, -117.81], 55.2),
+    ("Around waypoint 5", [-870, -901.37, -20], 159.9),
+    ("Waypoint 5", [-894.61, -901.37, -114.0], 159.9),
+    ("Around waypoint 6", [-890, -11, -12.82], 111.0),
+    ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
+    ("Return Origin", [0.0, 148.0, -2.0], 90.0),
+]
+
 FULL_OFFSHORE_ROUTE = [
     ("Origin", [0.0, 148.0, -2.0], 270.0),
     ("Mission Start", [0.0, 130.0, -2.0], 270.0),
@@ -121,15 +123,15 @@ FULL_OFFSHORE_ROUTE = [
     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
 ]
-OFFSHORE_ROUTE = [
-    ("Origin", [-30.7, -905.2, -50.4], 178.4),
-    ("Mission Start", [-40.7, -909.2, -112.4], 178.4),
-    ("Around waypoint 5", [-880, -895, -16], 180.0),
-    ("Waypoint 5", [-892, -902, -12.0], 164),
-    ("Around waypoint 6", [-890, -11, -12.82], 111.0),
-    ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
-    ("Return Origin", [0.0, 148.0, -2.0], 90.0),
-]
+# OFFSHORE_ROUTE = [
+#     ("Origin", [-30.7, -905.2, -50.4], 178.4),
+#     ("Mission Start", [-40.7, -909.2, -112.4], 178.4),
+#     ("Around waypoint 5", [-880, -895, -16], 180.0),
+#     ("Waypoint 5", [-892, -902, -12.0], 164),
+#     ("Around waypoint 6", [-890, -11, -12.82], 111.0),
+#     ("Waypoint 6", [-899.67, -5.87, -7.82], 111.0),
+#     ("Return Origin", [0.0, 148.0, -2.0], 90.0),
+# ]
 
 
 
@@ -139,7 +141,8 @@ CHASE_MAX_CAMERA_OFFSET_M = 13.0
 BATTERY_START_LABEL = "Mission Start"
 BATTERY_SECONDS_PER_PERCENT = 0.4 * 60.0
 COVERAGE_UNFEASIBLE_HOLD_SEC = 2.0
-INSPECTION_TARGET_OBJECT = "Blade1_Object1"
+# INSPECTION_TARGET_OBJECT = "Blade1_Object1"
+INSPECTION_TARGET_OBJECT = "crack_img"
 INSPECTION_NORMAL_OBJECT = "Blade1_Normal1"
 INSPECTION_ROOT_OBJECT = "Blade1_Root"
 INSPECTION_TIP_OBJECT = "Blade1_Tip"
@@ -149,6 +152,7 @@ INSPECTION_DEFAULT_WEIGHTS = (0.20, 0.25, 0.30, 0.25)
 INSPECTION_STABILITY_WINDOW_SEC = 1.0
 INSPECTION_STABILITY_MAX_JITTER_NORM = 0.035
 INSPECTION_VISUAL_FULL_AREA_RATIO = 0.012
+INSPECTION_SPHERE_BASE_DIAMETER_M = 1.0
 WARNED_UNAVAILABLE = set()
 
 
@@ -303,6 +307,18 @@ def compact_vector(values: Optional[Sequence[float]]) -> str:
     return f"[{values[0]:.1f}, {values[1]:.1f}, {values[2]:.1f}]"
 
 
+def finite_vector(values: Optional[Sequence[float]], length: int = 3) -> Optional[List[float]]:
+    if values is None:
+        return None
+    try:
+        result = [float(values[index]) for index in range(length)]
+    except (IndexError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in result):
+        return None
+    return result
+
+
 def rotation_yaw_deg(rotation) -> Optional[float]:
     if not rotation:
         return None
@@ -335,13 +351,16 @@ def extract_pose_position(pose_or_kinematics) -> Optional[List[float]]:
     if not isinstance(position, dict):
         return None
     try:
-        return [
+        result = [
             float(position["x"]),
             float(position["y"]),
             float(position["z"]),
         ]
     except (KeyError, TypeError, ValueError):
         return None
+    if not all(math.isfinite(value) for value in result):
+        return None
+    return result
 
 
 def extract_pose_yaw_deg(pose_or_kinematics) -> Optional[float]:
@@ -393,6 +412,21 @@ def span_percent_along_blade(
     root_to_target = vector_subtract(target, root)
     fraction = clamp(vector_dot(root_to_target, root_to_tip) / length_sq, 0.0, 1.0)
     return 100.0 * fraction
+
+
+def sphere_size_from_scale(
+    scale: Optional[Sequence[float]],
+) -> Tuple[Optional[float], Optional[float]]:
+    scale_values = finite_vector(scale)
+    if scale_values is None:
+        return None, None
+    diameter_m = INSPECTION_SPHERE_BASE_DIAMETER_M * (
+        sum(abs(value) for value in scale_values) / len(scale_values)
+    )
+    if diameter_m <= 0.0:
+        return None, None
+    surface_area_m2 = math.pi * diameter_m * diameter_m
+    return diameter_m, surface_area_m2
 
 
 def parse_inspection_confidence_weights(value: str) -> Tuple[float, float, float, float]:
@@ -1266,6 +1300,10 @@ class OffshorePreview:
         span_text = "n/a" if span_percent is None else f"{float(span_percent):.0f}%"
         confidence_text = f"{confidence:.2f} {result}" if active else "n/a outside radius"
         camera_distance_m = inspection.get("camera_distance_m", inspection.get("distance_m", 0.0))
+        object_diameter_m = inspection.get("object_diameter_m")
+        object_area_m2 = inspection.get("object_area_m2")
+        diameter_text = "n/a" if object_diameter_m is None else f"{float(object_diameter_m):.2f} m"
+        area_text = "n/a" if object_area_m2 is None else f"{float(object_area_m2):.2f} m^2"
 
         lines = [
             "INSPECTION",
@@ -1274,6 +1312,8 @@ class OffshorePreview:
                 f"OBJ    {target_position[0]:.1f}, "
                 f"{target_position[1]:.1f}, {target_position[2]:.1f}"
             ),
+            f"DIAM   {diameter_text}",
+            f"AREA   {area_text}",
             (
                 f"DRONE  {drone_position[0]:.1f}, "
                 f"{drone_position[1]:.1f}, {drone_position[2]:.1f}"
@@ -2259,6 +2299,11 @@ def update_inspection_geometry(
         return
 
     target_position, normal_position, root_position, tip_position = positions
+    target_scale = safe_call(
+        "Inspection target scale",
+        lambda: world.get_object_scale(INSPECTION_TARGET_OBJECT),
+    )
+    object_diameter_m, object_area_m2 = sphere_size_from_scale(target_scale)
     radius_m = max(0.1, float(args.inspection_radius_m))
     camera_distance_m = distance_between(camera_position, target_position)
     drone_distance_m = distance_between(drone_position, target_position)
@@ -2282,6 +2327,9 @@ def update_inspection_geometry(
             "target_position": list(target_position),
             "drone_position": list(drone_position),
             "camera_position": list(camera_position),
+            "object_scale": finite_vector(target_scale),
+            "object_diameter_m": object_diameter_m,
+            "object_area_m2": object_area_m2,
             "distance_m": float(camera_distance_m),
             "camera_distance_m": float(camera_distance_m),
             "drone_distance_m": float(drone_distance_m),
