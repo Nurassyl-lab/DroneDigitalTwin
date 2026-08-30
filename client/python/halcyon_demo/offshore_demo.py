@@ -160,6 +160,13 @@ INSPECTION_FRAME_COMFORT_MARGIN_FRACTION = 0.12
 INSPECTION_SHARPNESS_MIN_VARIANCE = 40.0
 INSPECTION_SHARPNESS_GOOD_VARIANCE = 180.0
 INSPECTION_VISUAL_DEBUG_INTERVAL_SEC = 1.0
+VIDEO_MAX_CATCH_UP_SEC = 0.25
+VIDEO_CODEC_CANDIDATES = (
+    ("mp4v", ".mp4"),
+    ("avc1", ".mp4"),
+    ("XVID", ".avi"),
+    ("MJPG", ".avi"),
+)
 ARTIFICIAL_WIND_DEFAULT_BASE_DIRECTION_DEG = 195.0
 ARTIFICIAL_WIND_DEFAULT_UPDATE_HZ = 8.0
 HOLD_DEFAULT_UPDATE_HZ = 5.0
@@ -1072,6 +1079,8 @@ class OffshorePreview:
         self.video_started_at = None
         self.video_last_frame_at = None
         self.video_finalized = False
+        self.video_error = None
+        self.video_max_catch_up_frames = max(1, int(self.video_fps * VIDEO_MAX_CATCH_UP_SEC))
         self.fpv_images = queue.SimpleQueue()
         self.chase_images = queue.SimpleQueue()
         self.running = False
@@ -1104,44 +1113,79 @@ class OffshorePreview:
             self.close_video_writer()
         self.thread = None
 
-    def ensure_video_writer(self, cv2):
+    def ensure_video_writer(self, cv2) -> bool:
         if not self.record_video or self.video_writer is not None:
-            return
+            return self.video_writer is not None
 
         self.video_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self.video_path = self.video_dir / f"offshore_demo_{timestamp}.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(
-            str(self.video_path),
-            fourcc,
-            self.video_fps,
-            (self.width, self.height),
-        )
-        if not writer.isOpened():
+        tried = []
+        for codec, extension in VIDEO_CODEC_CANDIDATES:
+            video_path = self.video_dir / f"offshore_demo_{timestamp}{extension}"
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            writer = cv2.VideoWriter(
+                str(video_path),
+                fourcc,
+                self.video_fps,
+                (self.width, self.height),
+            )
+            if writer.isOpened():
+                self.video_path = video_path
+                self.video_writer = writer
+                projectairsim_log().info(
+                    "Recording preview video to %s at %.1f FPS using %s",
+                    self.video_path,
+                    self.video_fps,
+                    codec,
+                )
+                return True
             writer.release()
-            raise RuntimeError(f"Could not open video writer: {self.video_path}")
+            tried.append(f"{codec}{extension}")
 
-        self.video_writer = writer
-        projectairsim_log().info(
-            "Recording preview video to %s at %.1f FPS",
-            self.video_path,
-            self.video_fps,
+        self.video_error = (
+            f"Could not open video writer in {self.video_dir} "
+            f"with codecs: {', '.join(tried)}"
         )
+        self.record_video = False
+        self.video_finalized = True
+        projectairsim_log().warning(
+            "%s. Continuing without video so PX4 flight is not stopped.",
+            self.video_error,
+        )
+        return False
 
     def write_video_frame(self, cv2, frame):
         if not self.record_video:
             return
-        self.ensure_video_writer(cv2)
-        now = time.monotonic()
-        if self.video_started_at is None:
-            self.video_started_at = now
+        try:
+            if not self.ensure_video_writer(cv2):
+                return
+            now = time.monotonic()
+            if self.video_started_at is None:
+                self.video_started_at = now
 
-        target_frame_count = int((now - self.video_started_at) * self.video_fps) + 1
-        while self.video_frame_count < target_frame_count:
-            self.video_writer.write(frame)
-            self.video_frame_count += 1
-        self.video_last_frame_at = now
+            target_frame_count = int((now - self.video_started_at) * self.video_fps) + 1
+            frames_to_write = min(
+                max(0, target_frame_count - self.video_frame_count),
+                self.video_max_catch_up_frames,
+            )
+            for _ in range(frames_to_write):
+                self.video_writer.write(frame)
+                self.video_frame_count += 1
+            self.video_last_frame_at = now
+        except Exception as exc:
+            self.video_error = str(exc)
+            with suppress(Exception):
+                if self.video_writer is not None:
+                    self.video_writer.release()
+            self.video_writer = None
+            self.record_video = False
+            self.video_finalized = True
+            projectairsim_log().warning(
+                "Video recording disabled after writer error: %s. "
+                "Continuing so PX4 flight is not stopped.",
+                exc,
+            )
 
     def close_video_writer(self):
         if self.video_finalized:
