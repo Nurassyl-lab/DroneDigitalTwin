@@ -3855,7 +3855,7 @@ async def run_manual_px4_flight(
     max_yaw_delta = (
         max(0.0, float(args.manual_yaw_acceleration_dps2)) * command_duration_sec
     )
-    yaw_rate_dps = max(0.0, float(args.manual_yaw_rate_dps))
+    yaw_rate_dps = max(0.0, float(args.manual_px4_yaw_rate_dps))
     speed_adjust_debounce_sec = 0.25
     last_speed_adjust_at = 0.0
     last_report_at = 0.0
@@ -4527,7 +4527,13 @@ def build_parser():
         "--manual-yaw-rate-dps",
         type=float,
         default=60.0,
-        help="Manual yaw rate for left/right arrow keys.",
+        help="Manual direct yaw rate for left/right arrow keys.",
+    )
+    parser.add_argument(
+        "--manual-px4-yaw-rate-dps",
+        type=float,
+        default=30.0,
+        help="Manual PX4 yaw rate for left/right arrow keys.",
     )
     parser.add_argument(
         "--manual-command-duration-sec",
@@ -4538,14 +4544,14 @@ def build_parser():
     parser.add_argument(
         "--manual-acceleration-limit-mps2",
         type=float,
-        default=20.0,
-        help="Manual PX4 velocity change rate. Higher values make K/L speed changes take effect faster.",
+        default=6.0,
+        help="Manual PX4 velocity change rate. Matches px4_astar keyboard smoothing by default.",
     )
     parser.add_argument(
         "--manual-yaw-acceleration-dps2",
         type=float,
-        default=180.0,
-        help="Manual PX4 yaw-rate change rate.",
+        default=120.0,
+        help="Manual PX4 yaw-rate change rate. Matches px4_astar keyboard smoothing by default.",
     )
     parser.add_argument(
         "--manual-px4-takeoff",
